@@ -22,7 +22,10 @@ Import Evernote `.enex` export files into Microsoft OneNote (personal Microsoft 
 
 ## General Users (Recommended)
 
-1. Open this GitHub repository page in your browser.
+No prebuilt `.exe` is distributed. You build it locally with one double-click script.
+
+1. Open this GitHub repository page in your browser:
+   https://github.com/yiluzhou/Evernote_converter
 2. Click the green **Code** button.
 3. Click **Download ZIP**.
 4. Open your **Downloads** folder.
@@ -36,9 +39,12 @@ Notes:
 - If Python is missing, it automatically downloads and installs Python 3.14 into project-local folder `.python_runtime`.
 - It installs build dependencies only inside `.build_env` (not system Python / not your conda envs).
 - Internet connection is required for first-time auto bootstrap.
+- If an update is detected, the app opens the repository homepage only.
 - No installer/uninstaller is required.
 
 ## Advanced Users (Pro Only): Build the Windows App Yourself
+
+No prebuilt `.exe` is distributed. Advanced users also build locally.
 
 Use any one environment workflow below.
 Then run `Build_EvernoteToOneNoteWizard_Advanced.bat` from the project main folder.

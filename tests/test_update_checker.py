@@ -32,28 +32,6 @@ def test_is_newer_version_handles_different_widths():
     assert not update_checker.is_newer_version("1.2.1", "1.2.0")
 
 
-def test_select_download_url_prefers_exe_over_zip():
-    assets = [
-        {
-            "name": "EvernoteToOneNoteWizard.exe",
-            "browser_download_url": "https://example.com/wizard.exe",
-        },
-        {
-            "name": "EvernoteToOneNoteWizard-1.2.0.zip",
-            "browser_download_url": "https://example.com/wizard.zip",
-        },
-        {
-            "name": "source.zip",
-            "browser_download_url": "https://example.com/source.zip",
-        },
-    ]
-
-    assert (
-        update_checker.select_download_url(assets, "https://example.com/releases/latest")
-        == "https://example.com/wizard.exe"
-    )
-
-
 def test_get_latest_release_update_returns_none_when_not_newer(monkeypatch):
     def _fake_get(*_args, **_kwargs):
         return _FakeResponse(
@@ -73,18 +51,13 @@ def test_get_latest_release_update_returns_none_when_not_newer(monkeypatch):
     assert result is None
 
 
-def test_get_latest_release_update_returns_download_link(monkeypatch):
+def test_get_latest_release_update_returns_repo_link(monkeypatch):
     def _fake_get(*_args, **_kwargs):
         return _FakeResponse(
             {
                 "tag_name": "v1.3.0",
                 "html_url": "https://github.com/org/repo/releases/tag/v1.3.0",
-                "assets": [
-                    {
-                        "name": "EvernoteToOneNoteWizard-1.3.0.exe",
-                        "browser_download_url": "https://example.com/wizard-1.3.0.exe",
-                    }
-                ],
+                "assets": [],
             }
         )
 
@@ -93,8 +66,10 @@ def test_get_latest_release_update_returns_download_link(monkeypatch):
         current_version="1.2.0",
         api_url="https://api.example.com/latest",
         fallback_page_url="https://example.com/releases/latest",
+        repo_page_url="https://github.com/org/repo",
     )
 
     assert result is not None
     assert result["latest_version"] == "v1.3.0"
-    assert result["download_url"] == "https://example.com/wizard-1.3.0.exe"
+    assert result["repo_url"] == "https://github.com/org/repo"
+    assert result["download_url"] == "https://github.com/org/repo"

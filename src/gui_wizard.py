@@ -196,19 +196,19 @@ def _maybe_alert_update_available(root: tk.Tk) -> None:
         return
 
     latest_version = update["latest_version"]
-    download_url = update["download_url"]
+    repo_url = update.get("repo_url") or update.get("download_url", "")
     prompt = (
         "A newer version is available.\n\n"
         f"Current version: {APP_VERSION}\n"
         f"Latest version: {latest_version}\n\n"
-        "Open download link now?"
+        "Open repository page now?"
     )
     if messagebox.askyesno("Update Available", prompt, parent=root):
         try:
-            webbrowser.open(download_url)
+            webbrowser.open(repo_url)
         except Exception as e:
             logger.debug("Failed to open update link: %s", e)
-            messagebox.showinfo("Download Link", download_url, parent=root)
+            messagebox.showinfo("Repository Link", repo_url, parent=root)
 
 
 def _select_enex_files(root: tk.Tk, default_enex_dir: Path) -> list[Path] | None:

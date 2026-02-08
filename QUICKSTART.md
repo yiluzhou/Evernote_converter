@@ -10,7 +10,10 @@
 
 ## General Users (Recommended)
 
-1. Open this GitHub repository page.
+No prebuilt `.exe` is distributed. Build it locally:
+
+1. Open this GitHub repository page:
+   https://github.com/yiluzhou/Evernote_converter
 2. Click **Code** -> **Download ZIP**.
 3. In Downloads, right-click the ZIP -> **Extract All...**.
 4. Open the extracted folder.
@@ -23,8 +26,11 @@ Notes:
 - Build dependencies are installed only into local `.build_env`.
 - Existing system Python/conda environments are not modified by the general-user script.
 - Internet connection is required for first-time auto bootstrap.
+- If an update is detected, the app opens the repository homepage only.
 
 ## Advanced Users (Pro): Build `.exe`
+
+No prebuilt `.exe` is distributed. Advanced users also build locally.
 
 Use one environment option, then run:
 

@@ -5,8 +5,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Any
-
 import requests
 
 logger = logging.getLogger(__name__)
@@ -46,53 +44,11 @@ def is_newer_version(current_version: str, latest_version: str) -> bool:
     return latest_padded > current_padded
 
 
-def select_download_url(assets: list[dict[str, Any]], fallback_url: str) -> str:
-    """
-    Pick a user-facing download URL from release assets.
-
-    Preference order:
-    1) EvernoteToOneNoteWizard.exe (or any .exe containing "wizard")
-    2) Any ZIP
-    3) Fallback release URL
-    """
-    if not assets:
-        return fallback_url
-
-    normalized_assets: list[dict[str, str]] = []
-    for asset in assets:
-        name = str(asset.get("name", "")).strip()
-        url = str(asset.get("browser_download_url", "")).strip()
-        if not name or not url:
-            continue
-        normalized_assets.append({"name": name, "url": url})
-
-    if not normalized_assets:
-        return fallback_url
-
-    preferred_exes = [
-        a
-        for a in normalized_assets
-        if a["name"].lower().endswith(".exe")
-        and "wizard" in a["name"].lower()
-    ]
-    if preferred_exes:
-        return preferred_exes[0]["url"]
-
-    any_exes = [a for a in normalized_assets if a["name"].lower().endswith(".exe")]
-    if any_exes:
-        return any_exes[0]["url"]
-
-    any_zips = [a for a in normalized_assets if a["name"].lower().endswith(".zip")]
-    if any_zips:
-        return any_zips[0]["url"]
-
-    return fallback_url
-
-
 def get_latest_release_update(
     current_version: str = APP_VERSION,
     api_url: str | None = None,
     fallback_page_url: str | None = None,
+    repo_page_url: str | None = None,
     timeout_sec: float = 3.5,
 ) -> dict[str, str] | None:
     """
@@ -101,7 +57,8 @@ def get_latest_release_update(
     Returns:
       {
         "latest_version": "<tag>",
-        "download_url": "<asset or release page>",
+        "repo_url": "<repository page>",
+        "download_url": "<repository page>",  # backward-compatible key
         "release_url": "<release page>"
       }
     """
@@ -113,6 +70,10 @@ def get_latest_release_update(
     resolved_fallback_page_url = fallback_page_url or os.environ.get(
         "ENEX_RELEASES_PAGE_URL",
         f"https://github.com/{repo}/releases/latest",
+    )
+    resolved_repo_page_url = repo_page_url or os.environ.get(
+        "ENEX_REPO_PAGE_URL",
+        f"https://github.com/{repo}",
     )
 
     try:
@@ -143,13 +104,10 @@ def get_latest_release_update(
         return None
 
     release_url = str(payload.get("html_url", "")).strip() or resolved_fallback_page_url
-    assets = payload.get("assets")
-    if not isinstance(assets, list):
-        assets = []
-    download_url = select_download_url(assets, release_url)
 
     return {
         "latest_version": latest_version,
-        "download_url": download_url,
+        "repo_url": resolved_repo_page_url,
+        "download_url": resolved_repo_page_url,
         "release_url": release_url,
     }

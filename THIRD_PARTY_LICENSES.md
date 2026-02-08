@@ -20,7 +20,7 @@ This file is a practical compatibility checklist, not legal advice.
 |---|---|---|
 | PyInstaller | GPL-2.0 with exception (plus Apache-2.0 for some files) | https://pyinstaller.org/en/stable/license.html |
 
-PyInstaller's exception states generated executables can be shipped under your own license, while respecting licenses of bundled dependencies.
+If you choose to distribute generated executables in the future, PyInstaller's exception allows shipping under your own license, while still respecting bundled dependency licenses.
 
 ## Reference-only projects (not dependencies)
 
