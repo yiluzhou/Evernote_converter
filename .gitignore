@@ -11,6 +11,7 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+dist_portable/
 downloads/
 eggs/
 .eggs/
@@ -137,6 +138,8 @@ celerybeat.pid
 # Environments
 .env
 .envrc
+.build_env/
+.python_runtime/
 .venv
 env/
 venv/
@@ -201,7 +204,14 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Local build output
+EvernoteToOneNoteWizard.exe
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+enex/
+Agents.md
