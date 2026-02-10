@@ -3,7 +3,7 @@
 Quick utility to list all OneNote notebooks via Graph API.
 
 Usage:
-    python check_notebooks.py
+    python scripts/check_notebooks.py
 
 This verifies that your upload succeeded and shows direct links to each notebook.
 """
@@ -11,11 +11,15 @@ This verifies that your upload succeeded and shows direct links to each notebook
 import json
 import os
 import sys
+from pathlib import Path
 
-sys.path.insert(0, "src")
+import requests
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT_DIR / "src"))
 
 from onenote_uploader import get_graph_token
-import requests
+
 
 # Load client ID from config
 config_path = os.path.expanduser("~/.evernote_converter/config.json")
@@ -47,18 +51,18 @@ if resp.status_code != 200:
     sys.exit(1)
 
 notebooks = resp.json().get("value", [])
-print(f"✓ Found {len(notebooks)} notebook(s):\n")
+print(f"Found {len(notebooks)} notebook(s):\n")
 
 for nb in notebooks:
-    print(f"📓 {nb['displayName']}")
-    print(f"   ID: {nb['id']}")
-    print(f"   Created: {nb.get('createdDateTime', 'N/A')}")
-    print(f"   Modified: {nb.get('lastModifiedDateTime', 'N/A')}")
+    print(f"Notebook: {nb['displayName']}")
+    print(f"  ID: {nb['id']}")
+    print(f"  Created: {nb.get('createdDateTime', 'N/A')}")
+    print(f"  Modified: {nb.get('lastModifiedDateTime', 'N/A')}")
 
     # Try to extract a clean OneDrive link
     web_url = nb.get("links", {}).get("oneNoteWebUrl", {}).get("href", "")
     if web_url:
-        print(f"   Link: {web_url}")
+        print(f"  Link: {web_url}")
     print()
 
 if not notebooks:

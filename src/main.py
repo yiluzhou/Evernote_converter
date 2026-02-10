@@ -28,8 +28,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 from enex_parser import EvernoteNote, enml_to_html, parse_enex  # noqa: E402
 from onenote_uploader import (  # noqa: E402
     AzureSetupGuidanceError,
+    OneNoteRequestSizeLimitError,
     OneNoteUploader,
+    analyze_note_multipart_limits,
     get_graph_token,
+    is_probable_request_size_error,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,6 +40,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_NOTEBOOK_NAME = "Evernote Import"
 DEFAULT_ENEX_DIR = "enex"
 WIZARD_TOTAL_STEPS = 6
+_MULTIPART_CHECK_DISPLAY_LIMIT = 8
 
 
 def main() -> None:
@@ -170,6 +174,7 @@ def _run_interactive_mode(args: argparse.Namespace) -> None:
 
     _print_step(3, "Parse Notes")
     all_sections, total_notes = _parse_selected_enex_files(selected_files)
+    _report_multipart_size_risks(all_sections)
 
     if args.dry_run:
         _run_dry_run_validation(all_sections, total_notes)
@@ -202,6 +207,11 @@ def _run_interactive_mode(args: argparse.Namespace) -> None:
         return
 
     _print_step(6, "Upload Notes")
+    _print_upload_eta(
+        uploader,
+        total_notes=total_notes,
+        section_count=len(all_sections),
+    )
     input("Press Enter to start upload...")
     try:
         _upload_sections(uploader, notebook_id, all_sections, total_notes)
@@ -227,6 +237,7 @@ def _run_advanced_mode(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     all_sections, total_notes = _parse_selected_enex_files(selected_files)
+    _report_multipart_size_risks(all_sections)
 
     if args.dry_run:
         _run_dry_run_validation(all_sections, total_notes)
@@ -249,6 +260,11 @@ def _run_advanced_mode(args: argparse.Namespace) -> None:
         print("Exiting without upload.")
         return
 
+    _print_upload_eta(
+        uploader,
+        total_notes=total_notes,
+        section_count=len(all_sections),
+    )
     try:
         _upload_sections(uploader, notebook_id, all_sections, total_notes)
     except AzureSetupGuidanceError as e:
@@ -474,6 +490,69 @@ def _run_dry_run_validation(
     print("[DRY RUN] No upload performed.")
 
 
+def _report_multipart_size_risks(
+    all_sections: dict[str, list[EvernoteNote]],
+) -> None:
+    """
+    Pre-check OneNote multipart request-size risks after ENEX load.
+
+    This helps users spot likely upload failures before authentication/upload.
+    """
+    hard_hits: list[tuple[str, str, str]] = []
+    warning_hits: list[tuple[str, str, str]] = []
+    checked_notes = 0
+
+    for section_name, notes in all_sections.items():
+        for note in notes:
+            if not note.resources:
+                continue
+
+            try:
+                resource_map = {r.md5_hash: r for r in note.resources}
+                html_body = enml_to_html(note.content_enml, resource_map)
+            except Exception:
+                # Conversion issues are reported in dry-run/upload paths.
+                continue
+
+            analysis = analyze_note_multipart_limits(note, html_body)
+            if not analysis["uses_multipart"]:
+                continue
+            checked_notes += 1
+
+            title = (note.title or "").strip() or "Untitled"
+            if analysis["violations"]:
+                hard_hits.append((section_name, title, "; ".join(analysis["violations"])))
+            elif analysis["warnings"]:
+                warning_hits.append((section_name, title, "; ".join(analysis["warnings"])))
+
+    if checked_notes == 0:
+        return
+
+    if hard_hits:
+        print(
+            "\nWARNING: "
+            f"{len(hard_hits)} note(s) exceed OneNote multipart request-size limits "
+            "and will be skipped automatically during upload."
+        )
+        for section_name, title, details in hard_hits[:_MULTIPART_CHECK_DISPLAY_LIMIT]:
+            print(f"  - [{section_name}] {title}: {details}")
+        if len(hard_hits) > _MULTIPART_CHECK_DISPLAY_LIMIT:
+            remaining = len(hard_hits) - _MULTIPART_CHECK_DISPLAY_LIMIT
+            print(f"  ... and {remaining} more note(s)")
+
+    if warning_hits:
+        print(
+            "\nNotice: "
+            f"{len(warning_hits)} note(s) are close to OneNote multipart limits "
+            "(may fail depending on payload overhead)."
+        )
+        for section_name, title, details in warning_hits[:_MULTIPART_CHECK_DISPLAY_LIMIT]:
+            print(f"  - [{section_name}] {title}: {details}")
+        if len(warning_hits) > _MULTIPART_CHECK_DISPLAY_LIMIT:
+            remaining = len(warning_hits) - _MULTIPART_CHECK_DISPLAY_LIMIT
+            print(f"  ... and {remaining} more note(s)")
+
+
 def _prompt_for_notebook_choice(
     uploader: OneNoteUploader,
     default_new_name: str,
@@ -534,6 +613,38 @@ def _confirm_existing_notebook(notebook_name: str, notebook_url: str) -> bool:
     return proceed in {"y", "yes"}
 
 
+def _format_eta(seconds: float) -> str:
+    total = max(int(round(seconds)), 0)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes > 0:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _print_upload_eta(
+    uploader: OneNoteUploader,
+    total_notes: int,
+    section_count: int,
+) -> None:
+    estimate_seconds = uploader.estimate_upload_duration_seconds(
+        expected_page_writes=total_notes,
+        expected_section_creates=section_count,
+    )
+    per_minute, per_hour = uploader.get_write_rate_limits()
+    print(
+        "Estimated upload time (rate-limited baseline): "
+        f"~{_format_eta(estimate_seconds)} "
+        f"for {total_notes} notes across {section_count} section(s)."
+    )
+    print(
+        f"Assumes write pacing limits {per_minute}/min and {per_hour}/hour; "
+        "duplicates, retries, and network delays can increase actual time."
+    )
+
+
 def _upload_sections(
     uploader: OneNoteUploader,
     notebook_id: str,
@@ -543,6 +654,7 @@ def _upload_sections(
     errors: list[tuple[str, str]] = []
     uploaded_notes = 0
     skipped_duplicates = 0
+    skipped_oversized = 0
     replaced_pages = 0
     duplicate_policy: str | None = None  # replace_all / skip_all
 
@@ -643,9 +755,16 @@ def _upload_sections(
                     fallback_index.setdefault(fallback_identity, []).append(entry)
                 except AzureSetupGuidanceError:
                     raise
+                except OneNoteRequestSizeLimitError as e:
+                    skipped_oversized += 1
+                    tqdm.write(f"  SKIP oversized note: {note.title} ({e})")
                 except Exception as e:
-                    errors.append((note.title, str(e)))
-                    tqdm.write(f"  ERROR: '{note.title}': {e}")
+                    if is_probable_request_size_error(e):
+                        skipped_oversized += 1
+                        tqdm.write(f"  SKIP oversized note: {note.title} ({e})")
+                    else:
+                        errors.append((note.title, str(e)))
+                        tqdm.write(f"  ERROR: '{note.title}': {e}")
 
                 pbar.update(1)
 
@@ -654,6 +773,8 @@ def _upload_sections(
         print(f"Replaced {replaced_pages} existing duplicate page(s).")
     if skipped_duplicates:
         print(f"Skipped {skipped_duplicates} duplicate note(s).")
+    if skipped_oversized:
+        print(f"Skipped {skipped_oversized} oversized note(s).")
     if errors:
         print(f"\n{len(errors)} failed note(s):")
         for title, err in errors:
@@ -752,7 +873,7 @@ def _print_finish(notebook_url: str) -> None:
         print("\nAlternatively:")
     print("  1. OneDrive: https://onedrive.live.com/ > Documents folder")
     print("  2. OneNote: https://www.onenote.com/notebooks (may take 1-5 min to sync)")
-    print("  3. Run: python check_notebooks.py (lists all notebooks with links)")
+    print("  3. Run: python scripts/check_notebooks.py (lists all notebooks with links)")
 
 
 def _sanitize_section_name(name: str) -> str:

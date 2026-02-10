@@ -2,6 +2,10 @@
 
 Import Evernote `.enex` export files into Microsoft OneNote (personal Microsoft account) using Microsoft Graph API.
 
+## App Screenshot
+
+<img src="docs/images/evernote-to-onenote-wizard-step1.png" alt="Evernote to OneNote Wizard - Step 1" width="760" />
+
 ## How It Maps
 
 | Evernote | OneNote |
@@ -16,11 +20,16 @@ Import Evernote `.enex` export files into Microsoft OneNote (personal Microsoft 
 
 | User Type | Best For | Effort | Difficulty |
 |----------|----------|--------|------------|
-| General User (Recommended) | No Python knowledge, just want the app | ~5-10 min | ★☆☆☆☆ |
-| Advanced User (Pro Only) | Build your own `.exe` with custom env | ~10-20 min | ★★★☆☆ |
+| General User (Windows only, Recommended) | No Python knowledge, just want the app | ~5-10 min | ★☆☆☆☆ |
+| Advanced User (Windows only, Pro Only) | Build your own `.exe` with custom env | ~10-20 min | ★★★☆☆ |
 | Developer | Run/modify source code | ~10 min | ★★★★☆ |
 
+Note: `General User` and `Advanced User` paths are Windows-only.  
+If you are on macOS/Linux, use the `Developer` path.
+
 ## General Users (Recommended)
+
+Windows only.
 
 No prebuilt `.exe` is distributed. You build it locally with one double-click script.
 
@@ -43,6 +52,8 @@ Notes:
 - No installer/uninstaller is required.
 
 ## Advanced Users (Pro Only): Build the Windows App Yourself
+
+Windows only.
 
 No prebuilt `.exe` is distributed. Advanced users also build locally.
 
@@ -80,6 +91,8 @@ Build_EvernoteToOneNoteWizard_Advanced.bat
 ```
 
 ## Developers: Run from Source
+
+Cross-platform (Windows/macOS/Linux).
 
 Set up a Python environment first, then run from source.
 
@@ -150,7 +163,7 @@ python src/main.py --advanced --enex-dir enex/ --notebook-name "Evernote Import"
 3. Verify by API:
 
 ```bash
-python check_notebooks.py
+python scripts/check_notebooks.py
 ```
 
 ## Project Structure
@@ -165,6 +178,7 @@ src/
   update_checker.py
   main.py
 scripts/
+  check_notebooks.py
   build_windows_exe.bat
   run_wizard.bat
 tests/

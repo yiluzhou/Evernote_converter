@@ -15,11 +15,14 @@ Reference:
 
 from __future__ import annotations
 
+from collections import deque
 import logging
 import os
 import re
+import threading
 import time
 from datetime import datetime, timezone
+from typing import Any, Callable
 
 import msal
 import requests
@@ -32,6 +35,24 @@ GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 SCOPES = ["Notes.Create", "Notes.ReadWrite"]
 AUTHORITY = "https://login.microsoftonline.com/consumers"  # personal MS accounts
 CACHE_FILE = os.path.expanduser("~/.evernote_converter/token_cache.json")
+ONENOTE_MULTIPART_MAX_PART_BYTES = 25 * 1024 * 1024
+ONENOTE_MULTIPART_MAX_TOTAL_BYTES = 75 * 1024 * 1024
+ONENOTE_MULTIPART_MAX_PARTS = 500
+# Estimated boundary/header overhead per multipart part for risk warnings.
+ONENOTE_MULTIPART_PART_OVERHEAD_ESTIMATE_BYTES = 1024
+ONENOTE_MULTIPART_WARNING_RATIO = 0.9
+DEFAULT_WRITE_LIMIT_PER_MINUTE = 100
+DEFAULT_WRITE_LIMIT_PER_HOUR = 350
+_REQUEST_SIZE_ERROR_KEYWORDS = (
+    "request entity too large",
+    "payload too large",
+    "request body too large",
+    "request is too large",
+    "maximum request length",
+    "maximum request size",
+    "exceeds the maximum",
+    "too large",
+)
 EVERNOTE_GUID_META_RE = re.compile(
     r"""<meta[^>]*name=["']evernote-guid["'][^>]*content=["']([^"']+)["'][^>]*>""",
     re.IGNORECASE,
@@ -54,6 +75,202 @@ class AzureSetupGuidanceError(RuntimeError):
             "If still stuck, take a screenshot of your Azure page and ask ChatGPT with this prompt:\n"
             f"{self.chatgpt_prompt}"
         )
+
+
+class OneNoteRequestSizeLimitError(RuntimeError):
+    """The note cannot be uploaded due to OneNote request-size limits."""
+
+
+def _read_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %d", name, raw, default)
+        return default
+    return max(value, 0)
+
+
+def _format_bytes(size: int) -> str:
+    """Human-readable byte size."""
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(size)
+    unit = units[0]
+    for candidate in units:
+        unit = candidate
+        if value < 1024 or candidate == units[-1]:
+            break
+        value /= 1024
+    if unit == "B":
+        return f"{int(value)} {unit}"
+    return f"{value:.2f} {unit}"
+
+
+def _looks_like_size_limit_error(status_code: int, error_text: str) -> bool:
+    if status_code == 413:
+        return True
+    lowered = (error_text or "").lower()
+    if not lowered:
+        return False
+    return any(keyword in lowered for keyword in _REQUEST_SIZE_ERROR_KEYWORDS)
+
+
+def analyze_note_multipart_limits(
+    note: EvernoteNote,
+    html_body: str,
+    page_html: str | None = None,
+) -> dict[str, Any]:
+    """
+    Analyze OneNote multipart request-size limits for a note.
+
+    Returns a dict with:
+      - uses_multipart (bool)
+      - used_resource_count (int)
+      - used_resource_hashes (set[str])
+      - multipart_part_count (int)
+      - presentation_size_bytes (int)
+      - largest_part_size_bytes (int)
+      - total_payload_bytes (int)
+      - total_payload_with_overhead_estimate_bytes (int)
+      - violations (list[str]) hard limit breaches
+      - warnings (list[str]) near-limit/risk warnings
+    """
+    if page_html is None:
+        page_html = build_onenote_page_html(note, html_body)
+
+    presentation_size = len(page_html.encode("utf-8"))
+    used_resources = [r for r in note.resources if f"name:{r.md5_hash}" in html_body]
+    used_hashes = {r.md5_hash for r in used_resources}
+    uses_multipart = bool(used_resources)
+
+    result: dict[str, Any] = {
+        "uses_multipart": uses_multipart,
+        "used_resource_count": len(used_resources),
+        "used_resource_hashes": used_hashes,
+        "multipart_part_count": 0,
+        "presentation_size_bytes": presentation_size,
+        "largest_part_size_bytes": 0,
+        "total_payload_bytes": 0,
+        "total_payload_with_overhead_estimate_bytes": 0,
+        "violations": [],
+        "warnings": [],
+    }
+
+    if not uses_multipart:
+        return result
+
+    part_sizes: list[tuple[str, int]] = [("Presentation", presentation_size)]
+    part_sizes.extend((r.filename or r.md5_hash, len(r.data)) for r in used_resources)
+
+    part_count = len(part_sizes)
+    largest_part = max(size for _, size in part_sizes)
+    total_payload = sum(size for _, size in part_sizes)
+    total_with_overhead = (
+        total_payload + part_count * ONENOTE_MULTIPART_PART_OVERHEAD_ESTIMATE_BYTES
+    )
+
+    violations: list[str] = []
+    warnings: list[str] = []
+
+    if part_count > ONENOTE_MULTIPART_MAX_PARTS:
+        violations.append(
+            f"multipart part count {part_count} exceeds "
+            f"{ONENOTE_MULTIPART_MAX_PARTS}"
+        )
+
+    oversized_parts = [
+        (name, size)
+        for name, size in part_sizes
+        if size > ONENOTE_MULTIPART_MAX_PART_BYTES
+    ]
+    if oversized_parts:
+        examples = ", ".join(
+            f"{name} ({_format_bytes(size)})"
+            for name, size in oversized_parts[:3]
+        )
+        if len(oversized_parts) > 3:
+            examples += ", ..."
+        violations.append(
+            "one or more multipart parts exceed "
+            f"{_format_bytes(ONENOTE_MULTIPART_MAX_PART_BYTES)} "
+            f"(examples: {examples})"
+        )
+
+    if total_payload > ONENOTE_MULTIPART_MAX_TOTAL_BYTES:
+        violations.append(
+            "multipart payload size "
+            f"{_format_bytes(total_payload)} exceeds "
+            f"{_format_bytes(ONENOTE_MULTIPART_MAX_TOTAL_BYTES)}"
+        )
+
+    if (
+        total_payload <= ONENOTE_MULTIPART_MAX_TOTAL_BYTES
+        and total_with_overhead > ONENOTE_MULTIPART_MAX_TOTAL_BYTES
+    ):
+        warnings.append(
+            "multipart payload is near 75 MB; multipart boundary overhead may exceed the limit"
+        )
+
+    if (
+        total_payload
+        >= int(ONENOTE_MULTIPART_MAX_TOTAL_BYTES * ONENOTE_MULTIPART_WARNING_RATIO)
+    ):
+        warnings.append(
+            "multipart payload is close to the 75 MB limit "
+            f"({_format_bytes(total_payload)})"
+        )
+
+    if (
+        largest_part
+        >= int(ONENOTE_MULTIPART_MAX_PART_BYTES * ONENOTE_MULTIPART_WARNING_RATIO)
+    ):
+        warnings.append(
+            "at least one multipart part is close to the 25 MB limit "
+            f"({_format_bytes(largest_part)})"
+        )
+
+    if part_count >= int(ONENOTE_MULTIPART_MAX_PARTS * ONENOTE_MULTIPART_WARNING_RATIO):
+        warnings.append(
+            f"multipart part count is close to the {ONENOTE_MULTIPART_MAX_PARTS} limit "
+            f"({part_count})"
+        )
+
+    result.update(
+        {
+            "multipart_part_count": part_count,
+            "largest_part_size_bytes": largest_part,
+            "total_payload_bytes": total_payload,
+            "total_payload_with_overhead_estimate_bytes": total_with_overhead,
+            "violations": violations,
+            "warnings": warnings,
+        }
+    )
+    return result
+
+
+def is_probable_request_size_error(error: Exception) -> bool:
+    """
+    Best-effort classifier for request-size limit failures.
+
+    Useful when service-side limits change and we need to skip oversized notes
+    without aborting the whole import run.
+    """
+    if isinstance(error, OneNoteRequestSizeLimitError):
+        return True
+
+    if isinstance(error, requests.HTTPError):
+        resp = getattr(error, "response", None)
+        if resp is not None:
+            try:
+                error_text = _extract_graph_error_text(resp)
+            except Exception:
+                error_text = str(error)
+            if _looks_like_size_limit_error(resp.status_code, error_text):
+                return True
+
+    return _looks_like_size_limit_error(0, str(error))
 
 
 def _build_chatgpt_prompt(error_text: str) -> str:
@@ -227,7 +444,10 @@ def _extract_evernote_guid_from_html(html: str) -> str:
 # Authentication
 # ---------------------------------------------------------------------------
 
-def get_graph_token(client_id: str) -> str:
+def get_graph_token(
+    client_id: str,
+    device_flow_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> str:
     """
     Authenticate via device code flow and return an access token.
 
@@ -259,7 +479,13 @@ def get_graph_token(client_id: str) -> str:
     if "user_code" not in flow:
         error_text = flow.get("error_description", "") or str(flow)
         raise _classify_azure_setup_error(f"Failed to create device flow: {error_text}")
-    print(flow["message"])  # "To sign in, use a web browser to open..."
+    if device_flow_callback is not None:
+        try:
+            device_flow_callback(flow)
+        except Exception as e:
+            logger.debug("Device-flow callback failed: %s", e)
+    else:
+        print(flow["message"])  # "To sign in, use a web browser to open..."
     result = app.acquire_token_by_device_flow(flow)
 
     if "access_token" not in result:
@@ -288,6 +514,52 @@ class OneNoteUploader:
         self.session.headers["Authorization"] = f"Bearer {access_token}"
         self._page_guid_cache: dict[str, str] = {}
         self._page_url_cache: dict[str, str] = {}
+        self._write_limit_per_minute = _read_int_env(
+            "ENEX_GRAPH_WRITE_LIMIT_PER_MINUTE",
+            DEFAULT_WRITE_LIMIT_PER_MINUTE,
+        )
+        self._write_limit_per_hour = _read_int_env(
+            "ENEX_GRAPH_WRITE_LIMIT_PER_HOUR",
+            DEFAULT_WRITE_LIMIT_PER_HOUR,
+        )
+        self._write_times_minute: deque[float] = deque()
+        self._write_times_hour: deque[float] = deque()
+        self._write_rate_lock = threading.Lock()
+
+    def get_write_rate_limits(self) -> tuple[int, int]:
+        """Return configured client-side write pacing limits (per-minute, per-hour)."""
+        return self._write_limit_per_minute, self._write_limit_per_hour
+
+    def estimate_upload_duration_seconds(
+        self,
+        expected_page_writes: int,
+        expected_section_creates: int = 0,
+        expected_page_deletes: int = 0,
+        extra_write_requests: int = 0,
+    ) -> float:
+        """
+        Estimate upload duration from expected write count and local rate limits.
+
+        This is a lower-bound estimate under normal network conditions and
+        without duplicate prompts/retries.
+        """
+        total_writes = max(expected_page_writes, 0)
+        total_writes += max(expected_section_creates, 0)
+        total_writes += max(expected_page_deletes, 0)
+        total_writes += max(extra_write_requests, 0)
+
+        if total_writes <= 0:
+            return 0.0
+
+        candidates: list[float] = []
+        if self._write_limit_per_minute > 0:
+            candidates.append((total_writes * 60.0) / self._write_limit_per_minute)
+        if self._write_limit_per_hour > 0:
+            candidates.append((total_writes * 3600.0) / self._write_limit_per_hour)
+
+        if not candidates:
+            return 0.0
+        return max(candidates) + 5.0
 
     def get_or_create_notebook(self, name: str) -> tuple[str, bool]:
         """
@@ -369,6 +641,18 @@ class OneNoteUploader:
         logger.info("Created new section: %s (id=%s)", name, resp["id"])
         return resp["id"], True
 
+    def list_sections(self, notebook_id: str) -> list[dict]:
+        """List all sections in a notebook with IDs and display names."""
+        sections: list[dict] = []
+        url = f"{GRAPH_BASE}/me/onenote/notebooks/{notebook_id}/sections?$top=100"
+        while url:
+            resp = self.session.get(url)
+            self._raise_for_status_with_guidance(resp, "List sections")
+            payload = resp.json()
+            sections.extend(payload.get("value", []))
+            url = payload.get("@odata.nextLink")
+        return sections
+
     def create_section(self, notebook_id: str, name: str) -> str:
         """Create a section in a notebook and return its ID (may create duplicate)."""
         resp = self._post_json(
@@ -443,8 +727,10 @@ class OneNoteUploader:
 
     def delete_page(self, page_id: str) -> None:
         """Delete a page by ID."""
-        resp = self.session.delete(f"{GRAPH_BASE}/me/onenote/pages/{page_id}")
-        self._raise_for_status_with_guidance(resp, "Delete page")
+        self._request_no_content_with_retry(
+            "DELETE",
+            f"{GRAPH_BASE}/me/onenote/pages/{page_id}",
+        )
         self._page_guid_cache.pop(page_id, None)
         self._page_url_cache.pop(page_id, None)
         logger.info("Deleted page: id=%s", page_id)
@@ -508,12 +794,26 @@ class OneNoteUploader:
         Returns the page ID.
         """
         page_html = build_onenote_page_html(note, html_body)
+        analysis = analyze_note_multipart_limits(note, html_body, page_html=page_html)
+        if analysis["violations"]:
+            raise OneNoteRequestSizeLimitError(
+                f"Note '{note.title or 'Untitled'}' exceeds OneNote multipart limits: "
+                + "; ".join(analysis["violations"])
+            )
+        for warning in analysis["warnings"]:
+            logger.warning(
+                "Note '%s': %s",
+                note.title or "Untitled",
+                warning,
+            )
+
         url = f"{GRAPH_BASE}/me/onenote/sections/{section_id}/pages"
 
         # Find resources actually referenced in the HTML
+        used_hashes: set[str] = analysis["used_resource_hashes"]
         used_resources = [
             r for r in note.resources
-            if f"name:{r.md5_hash}" in html_body
+            if r.md5_hash in used_hashes
         ]
 
         if not used_resources:
@@ -562,6 +862,7 @@ class OneNoteUploader:
     ) -> dict:
         """Execute an HTTP request with exponential backoff on 429."""
         for attempt in range(max_retries):
+            self._apply_client_side_write_rate_limit()
             resp = self.session.request(method, url, **kwargs)
 
             if resp.status_code == 429:
@@ -570,13 +871,88 @@ class OneNoteUploader:
                 time.sleep(wait)
                 continue
 
-            if resp.status_code == 201:
-                return resp.json()
+            if 200 <= resp.status_code < 300:
+                if not resp.text:
+                    return {}
+                try:
+                    return resp.json()
+                except ValueError:
+                    return {}
 
             # Non-retryable error
             self._raise_for_status_with_guidance(resp, f"{method} {url}")
 
         raise RuntimeError(f"Request failed after {max_retries} retries: {url}")
+
+    def _request_no_content_with_retry(
+        self,
+        method: str,
+        url: str,
+        max_retries: int = 5,
+        **kwargs,
+    ) -> None:
+        """Execute an HTTP request expecting no JSON body, with 429 retry."""
+        for attempt in range(max_retries):
+            self._apply_client_side_write_rate_limit()
+            resp = self.session.request(method, url, **kwargs)
+
+            if resp.status_code == 429:
+                wait = int(resp.headers.get("Retry-After", 2**attempt))
+                logger.warning("Rate limited, waiting %ds (attempt %d)", wait, attempt + 1)
+                time.sleep(wait)
+                continue
+
+            if 200 <= resp.status_code < 300:
+                return
+
+            self._raise_for_status_with_guidance(resp, f"{method} {url}")
+
+        raise RuntimeError(f"Request failed after {max_retries} retries: {url}")
+
+    def _apply_client_side_write_rate_limit(self) -> None:
+        """Proactively pace write requests to stay under delegated limits."""
+        if self._write_limit_per_minute <= 0 and self._write_limit_per_hour <= 0:
+            return
+
+        while True:
+            wait_seconds = 0.0
+            with self._write_rate_lock:
+                now = time.monotonic()
+
+                if self._write_limit_per_minute > 0:
+                    while self._write_times_minute and now - self._write_times_minute[0] >= 60:
+                        self._write_times_minute.popleft()
+                    if len(self._write_times_minute) >= self._write_limit_per_minute:
+                        wait_seconds = max(
+                            wait_seconds,
+                            60 - (now - self._write_times_minute[0]),
+                        )
+
+                if self._write_limit_per_hour > 0:
+                    while self._write_times_hour and now - self._write_times_hour[0] >= 3600:
+                        self._write_times_hour.popleft()
+                    if len(self._write_times_hour) >= self._write_limit_per_hour:
+                        wait_seconds = max(
+                            wait_seconds,
+                            3600 - (now - self._write_times_hour[0]),
+                        )
+
+                if wait_seconds <= 0:
+                    if self._write_limit_per_minute > 0:
+                        self._write_times_minute.append(now)
+                    if self._write_limit_per_hour > 0:
+                        self._write_times_hour.append(now)
+                    return
+
+            wait_seconds = max(wait_seconds, 0.01)
+            logger.info(
+                "Client-side write throttling: sleeping %.2fs "
+                "(limit %d/min, %d/hour)",
+                wait_seconds,
+                self._write_limit_per_minute,
+                self._write_limit_per_hour,
+            )
+            time.sleep(wait_seconds)
 
     def _raise_for_status_with_guidance(self, resp: requests.Response, operation: str) -> None:
         if resp.status_code < 400:
@@ -584,6 +960,11 @@ class OneNoteUploader:
 
         error_text = _extract_graph_error_text(resp)
         lower = error_text.lower()
+
+        if _looks_like_size_limit_error(resp.status_code, error_text):
+            raise OneNoteRequestSizeLimitError(
+                f"{operation} failed due to request-size limits: {error_text}"
+            )
 
         if resp.status_code in {400, 401, 403}:
             if (

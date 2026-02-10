@@ -204,6 +204,9 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Local AI/editor config
+.claude/
+
 # Local build output
 EvernoteToOneNoteWizard.exe
 

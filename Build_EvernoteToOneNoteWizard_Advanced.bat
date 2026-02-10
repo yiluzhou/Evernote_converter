@@ -16,21 +16,23 @@ if not defined PY (
     echo Detected active virtual environment:
     echo   %VIRTUAL_ENV%
     set "PY=python"
-  ) else if defined CONDA_PREFIX (
-    echo Detected active conda environment:
-    echo   %CONDA_PREFIX%
-    set "PY=python"
   ) else (
-    echo No active isolated environment detected.
-    echo.
-    echo Paste the full path to python.exe inside your env.
-    echo Example:
-    echo   C:\path\to\project\.venv\Scripts\python.exe
-    set /p PY=Env python.exe path (blank to cancel): 
-    if not defined PY (
-      echo Cancelled.
-      pause
-      exit /b 1
+    if defined CONDA_PREFIX (
+      echo Detected active conda environment:
+      echo   %CONDA_PREFIX%
+      set "PY=python"
+    ) else (
+      echo No active isolated environment detected.
+      echo.
+      echo Paste the full path to python.exe inside your env.
+      echo Example:
+      echo   C:\path\to\project\.venv\Scripts\python.exe
+      set /p PY=Env python.exe path - blank to cancel: 
+      if not defined PY (
+        echo Cancelled.
+        pause
+        exit /b 1
+      )
     )
   )
 )

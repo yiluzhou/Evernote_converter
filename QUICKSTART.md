@@ -1,14 +1,22 @@
 # Quick Start
 
+## App Screenshot
+
+<img src="docs/images/evernote-to-onenote-wizard-step1.png" alt="Evernote to OneNote Wizard - Step 1" width="760" />
+
 ## Pick Your Path
 
 | User Type | Effort | Difficulty | First Action |
 |----------|--------|------------|--------------|
-| General User | ~5-10 min | ★☆☆☆☆ | Double-click `Build_EvernoteToOneNoteWizard.bat` |
-| Advanced User (Pro) | ~10-20 min | ★★★☆☆ | Create env + run `scripts\\build_windows_exe.bat` |
+| General User (Windows only) | ~5-10 min | ★☆☆☆☆ | Double-click `Build_EvernoteToOneNoteWizard.bat` |
+| Advanced User (Windows only, Pro) | ~10-20 min | ★★★☆☆ | Create env + run `scripts\\build_windows_exe.bat` |
 | Developer | ~10 min | ★★★★☆ | Run `python src/main.py` |
 
+If you are not on Windows, use `Developer Path`.
+
 ## General Users (Recommended)
+
+Windows only.
 
 No prebuilt `.exe` is distributed. Build it locally:
 
@@ -29,6 +37,8 @@ Notes:
 - If an update is detected, the app opens the repository homepage only.
 
 ## Advanced Users (Pro): Build `.exe`
+
+Windows only.
 
 No prebuilt `.exe` is distributed. Advanced users also build locally.
 
@@ -66,6 +76,8 @@ Output:
 - `EvernoteToOneNoteWizard.exe` in the project main folder
 
 ## Developer Path
+
+Cross-platform (Windows/macOS/Linux).
 
 Set up a Python environment first.
 

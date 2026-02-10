@@ -5,6 +5,8 @@ import sys
 import types
 from datetime import datetime
 
+import pytest
+
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -16,12 +18,15 @@ if "msal" not in sys.modules:
         PublicClientApplication=object,
     )
 
-from enex_parser import EvernoteNote
+from enex_parser import EvernoteNote, EvernoteResource
 from onenote_uploader import (
     AzureSetupGuidanceError,
     GRAPH_BASE,
     OneNoteUploader,
+    OneNoteRequestSizeLimitError,
     _classify_azure_setup_error,
+    analyze_note_multipart_limits,
+    is_probable_request_size_error,
 )
 
 
@@ -226,3 +231,185 @@ def test_raise_for_status_with_guidance_falls_back_to_http_error():
         assert False, "Expected HTTP error passthrough"
     except RuntimeError as e:
         assert "HTTP 500" in str(e)
+
+
+def test_get_graph_token_device_flow_callback_receives_flow(monkeypatch, tmp_path):
+    class _FakeCache:
+        def deserialize(self, _text):
+            return None
+
+        def serialize(self):
+            return "{}"
+
+    class _FakeApp:
+        def __init__(self, client_id, authority, token_cache):
+            self.client_id = client_id
+            self.authority = authority
+            self.token_cache = token_cache
+
+        def get_accounts(self):
+            return []
+
+        def initiate_device_flow(self, scopes):
+            return {
+                "user_code": "ABCD-1234",
+                "verification_uri": "https://microsoft.com/devicelogin",
+                "message": "Use the code",
+            }
+
+        def acquire_token_by_device_flow(self, flow):
+            assert flow["user_code"] == "ABCD-1234"
+            return {"access_token": "token-123"}
+
+    monkeypatch.setattr(
+        sys.modules["onenote_uploader"].msal,
+        "SerializableTokenCache",
+        _FakeCache,
+    )
+    monkeypatch.setattr(
+        sys.modules["onenote_uploader"].msal,
+        "PublicClientApplication",
+        _FakeApp,
+    )
+    monkeypatch.setattr(sys.modules["onenote_uploader"], "CACHE_FILE", str(tmp_path / "cache.json"))
+
+    seen = {}
+
+    def _callback(flow):
+        seen.update(flow)
+
+    token = sys.modules["onenote_uploader"].get_graph_token(
+        "client-id",
+        device_flow_callback=_callback,
+    )
+
+    assert token == "token-123"
+    assert seen.get("user_code") == "ABCD-1234"
+
+
+def test_analyze_note_multipart_limits_reports_hard_violations(monkeypatch):
+    module = sys.modules["onenote_uploader"]
+    monkeypatch.setattr(module, "ONENOTE_MULTIPART_MAX_PART_BYTES", 80)
+    monkeypatch.setattr(module, "ONENOTE_MULTIPART_MAX_TOTAL_BYTES", 120)
+    monkeypatch.setattr(module, "ONENOTE_MULTIPART_MAX_PARTS", 2)
+    monkeypatch.setattr(module, "ONENOTE_MULTIPART_WARNING_RATIO", 0.9)
+
+    note = EvernoteNote(
+        title="Big multipart",
+        created=datetime(2025, 1, 1, 0, 0, 0),
+        updated=datetime(2025, 1, 1, 0, 0, 0),
+        content_enml="",
+        resources=[
+            EvernoteResource(
+                data=b"A" * 90,
+                mime="application/octet-stream",
+                filename="a.bin",
+                md5_hash="hash-a",
+            ),
+            EvernoteResource(
+                data=b"B" * 40,
+                mime="application/octet-stream",
+                filename="b.bin",
+                md5_hash="hash-b",
+            ),
+        ],
+    )
+
+    analysis = analyze_note_multipart_limits(
+        note,
+        '<img src="name:hash-a"/><object data="name:hash-b"></object>',
+    )
+
+    assert analysis["uses_multipart"] is True
+    assert analysis["multipart_part_count"] == 3
+    assert analysis["violations"]
+    assert any("part count" in message for message in analysis["violations"])
+
+
+def test_create_page_fails_locally_when_request_size_limit_exceeded(monkeypatch):
+    module = sys.modules["onenote_uploader"]
+    monkeypatch.setattr(module, "ONENOTE_MULTIPART_MAX_PART_BYTES", 50)
+    monkeypatch.setattr(module, "ONENOTE_MULTIPART_MAX_TOTAL_BYTES", 60)
+    monkeypatch.setattr(module, "ONENOTE_MULTIPART_MAX_PARTS", 500)
+
+    note = EvernoteNote(
+        title="Will fail size check",
+        created=datetime(2025, 1, 1, 0, 0, 0),
+        updated=datetime(2025, 1, 1, 0, 0, 0),
+        content_enml="",
+        resources=[
+            EvernoteResource(
+                data=b"C" * 55,
+                mime="application/octet-stream",
+                filename="c.bin",
+                md5_hash="hash-c",
+            )
+        ],
+    )
+    uploader = OneNoteUploader("token")
+
+    with pytest.raises(OneNoteRequestSizeLimitError):
+        uploader.create_page(
+            "section-1",
+            note,
+            '<object data="name:hash-c"></object>',
+        )
+
+
+def test_client_side_write_rate_limiter_waits_when_minute_window_is_full(monkeypatch):
+    module = sys.modules["onenote_uploader"]
+    uploader = OneNoteUploader("token")
+    uploader._write_limit_per_minute = 1
+    uploader._write_limit_per_hour = 0
+
+    class _Clock:
+        now = 1000.0
+
+    clock = _Clock()
+    sleeps: list[float] = []
+
+    def _fake_monotonic():
+        return clock.now
+
+    def _fake_sleep(seconds: float):
+        sleeps.append(seconds)
+        clock.now += seconds
+
+    monkeypatch.setattr(module.time, "monotonic", _fake_monotonic)
+    monkeypatch.setattr(module.time, "sleep", _fake_sleep)
+
+    uploader._apply_client_side_write_rate_limit()
+    uploader._apply_client_side_write_rate_limit()
+
+    assert sleeps
+    assert sleeps[0] >= 59.9
+
+
+def test_estimate_upload_duration_seconds_uses_hour_limit_when_slower():
+    uploader = OneNoteUploader("token")
+    uploader._write_limit_per_minute = 120
+    uploader._write_limit_per_hour = 60
+
+    estimate = uploader.estimate_upload_duration_seconds(
+        expected_page_writes=10,
+        expected_section_creates=2,
+    )
+
+    # 12 writes at 60/hour -> at least 12 minutes (+small overhead)
+    assert estimate >= (12 * 60)
+
+
+def test_is_probable_request_size_error_recognizes_http_413():
+    response = _FakeResponse(
+        payload={"error": {"code": "RequestEntityTooLarge", "message": "Payload too large"}},
+        status_code=413,
+    )
+    try:
+        response.raise_for_status()
+    except RuntimeError:
+        pass
+    # Build a requests.HTTPError with attached response.
+    import requests
+
+    exc = requests.HTTPError("413", response=response)
+    assert is_probable_request_size_error(exc) is True

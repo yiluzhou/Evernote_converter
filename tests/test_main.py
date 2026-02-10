@@ -4,6 +4,7 @@ import argparse
 import os
 import sys
 import types
+from datetime import datetime
 from pathlib import Path
 
 # Add src to path
@@ -19,9 +20,12 @@ if "msal" not in sys.modules:
 
 from main import (  # noqa: E402
     _determine_mode,
+    _upload_sections,
     _parse_index_selection,
     _resolve_requested_enex_files,
 )
+from enex_parser import EvernoteNote  # noqa: E402
+from onenote_uploader import OneNoteRequestSizeLimitError  # noqa: E402
 
 
 def test_parse_index_selection_blank_means_all():
@@ -98,3 +102,47 @@ def test_determine_mode_advanced_flag():
         advanced=True,
     )
     assert _determine_mode(args, ["--advanced"]) == "advanced"
+
+
+def test_upload_sections_skips_oversized_note_without_aborting():
+    class _Uploader:
+        def __init__(self):
+            self.created_pages = 0
+
+        def get_or_create_section(self, notebook_id, section_name):
+            return "section-1", True
+
+        @staticmethod
+        def page_identity_from_note(note):
+            return (note.title.strip(), note.created.strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+        def create_page(self, section_id, note, html_body):
+            if "big" in note.title.lower():
+                raise OneNoteRequestSizeLimitError("too large")
+            self.created_pages += 1
+            return f"page-{self.created_pages}"
+
+    uploader = _Uploader()
+    notes = [
+        EvernoteNote(
+            title="Big attachment note",
+            created=datetime(2025, 1, 1, 0, 0, 0),
+            updated=datetime(2025, 1, 1, 0, 0, 0),
+            content_enml="<en-note><div>hi</div></en-note>",
+        ),
+        EvernoteNote(
+            title="Small note",
+            created=datetime(2025, 1, 1, 0, 1, 0),
+            updated=datetime(2025, 1, 1, 0, 1, 0),
+            content_enml="<en-note><div>ok</div></en-note>",
+        ),
+    ]
+
+    _upload_sections(
+        uploader=uploader,
+        notebook_id="notebook-1",
+        all_sections={"sec": notes},
+        total_notes=2,
+    )
+
+    assert uploader.created_pages == 1

@@ -11,24 +11,26 @@ if "%~1"=="" (
     echo Using active virtual environment:
     echo   %VIRTUAL_ENV%
     set "PY=python"
-  ) else if defined CONDA_PREFIX (
-    echo Using active conda environment:
-    echo   %CONDA_PREFIX%
-    set "PY=python"
   ) else (
-    echo ERROR: No isolated Python environment detected.
-    echo.
-    echo To avoid changing your system/global Python, do one of:
-    echo   1) Run Build_EvernoteToOneNoteWizard.bat
-    echo   2) Activate a venv/conda env, then run this script
-    echo   3) Pass an explicit env python:
-    echo      scripts\build_windows_exe.bat .venv\Scripts\python.exe
-    exit /b 1
+    if defined CONDA_PREFIX (
+      echo Using active conda environment:
+      echo   %CONDA_PREFIX%
+      set "PY=python"
+    ) else (
+      echo ERROR: No isolated Python environment detected.
+      echo.
+      echo To avoid changing your system/global Python, do one of:
+      echo   1 - Run Build_EvernoteToOneNoteWizard.bat
+      echo   2 - Activate a venv/conda env, then run this script
+      echo   3 - Pass an explicit env python:
+      echo      scripts\build_windows_exe.bat .venv\Scripts\python.exe
+      exit /b 1
+    )
   )
 ) else (
   set "PY=%~1"
   echo Using explicit Python executable:
-  echo   %PY%
+  echo   %~1
 )
 
 %PY% -c "import sys" >nul 2>&1
@@ -45,6 +47,11 @@ if errorlevel 1 (
   --clean ^
   --windowed ^
   --onefile ^
+  --paths src ^
+  --hidden-import enex_parser ^
+  --hidden-import onenote_uploader ^
+  --hidden-import gui_wizard ^
+  --hidden-import update_checker ^
   --distpath . ^
   --workpath build\pyinstaller ^
   --specpath build\pyinstaller ^

@@ -45,6 +45,19 @@ if not defined PY_CMD (
   set "IS_LOCAL_PY=1"
 )
 
+if "%IS_LOCAL_PY%"=="1" (
+  call "%PY_CMD%" -c "import tkinter" >nul 2>&1
+  if errorlevel 1 (
+    echo Local Python is missing Tk support. Repairing local Python...
+    call :BOOTSTRAP_LOCAL_PYTHON
+    if errorlevel 1 (
+      echo Failed to repair local Python with Tk support.
+      pause
+      exit /b 1
+    )
+  )
+)
+
 set "ENV_DIR=.build_env"
 echo Using interpreter: %PY_CMD%
 echo Creating/updating local environment: %ENV_DIR%
@@ -110,7 +123,7 @@ if errorlevel 1 (
 )
 
 echo Installing Python into project-local folder...
-start /wait "" "%INSTALLER%" /quiet InstallAllUsers=0 Include_launcher=0 Include_pip=1 PrependPath=0 Include_test=0 Include_tcltk=0 Include_dev=0 Include_debug=0 Include_symbols=0 TargetDir="%LOCAL_PY_DIR%"
+start /wait "" "%INSTALLER%" /quiet InstallAllUsers=0 Include_launcher=0 Include_pip=1 PrependPath=0 Include_test=0 Include_tcltk=1 Include_dev=0 Include_debug=0 Include_symbols=0 Shortcuts=0 AssociateFiles=0 TargetDir="%LOCAL_PY_DIR%"
 if errorlevel 1 (
   echo Python installer failed.
   exit /b 1
