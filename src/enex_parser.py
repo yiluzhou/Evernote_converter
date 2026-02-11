@@ -62,7 +62,17 @@ def parse_enex(filepath: str) -> list[EvernoteNote]:
     Uses lxml iterparse for memory-efficient streaming of large files.
     """
     notes: list[EvernoteNote] = []
-    for _event, elem in etree.iterparse(filepath, events=("end",), tag="note"):
+    parse_kwargs: dict[str, object] = {
+        "events": ("end",),
+        "tag": "note",
+    }
+    try:
+        iterator = etree.iterparse(filepath, huge_tree=True, **parse_kwargs)
+    except TypeError:
+        # Older lxml may not support huge_tree; keep compatibility fallback.
+        iterator = etree.iterparse(filepath, **parse_kwargs)
+
+    for _event, elem in iterator:
         note = _parse_note_element(elem)
         notes.append(note)
         # Free memory — important for large exports

@@ -75,22 +75,24 @@ _ACTION_NEXT = "__next__"
 # Visual Theme
 # ---------------------------------------------------------------------------
 
-_COLOR_PRIMARY = "#0078D4"
-_COLOR_PRIMARY_HOVER = "#106EBE"
+_COLOR_PRIMARY = "#0F6CBD"
+_COLOR_PRIMARY_HOVER = "#115EA3"
 _COLOR_PRIMARY_TEXT = "#FFFFFF"
-_COLOR_BG = "#F3F3F3"
-_COLOR_HEADER_BG = "#0078D4"
+_COLOR_BG = "#F5F5F5"
+_COLOR_HEADER_BG = "#0F6CBD"
 _COLOR_HEADER_FG = "#FFFFFF"
 _COLOR_CONTENT_BG = "#FFFFFF"
-_COLOR_TEXT_PRIMARY = "#1A1A1A"
-_COLOR_TEXT_SECONDARY = "#555555"
-_COLOR_SEPARATOR = "#D0D0D0"
-_COLOR_WARNING_BG = "#FFF3CD"
-_COLOR_WARNING_FG = "#664D03"
-_COLOR_TOAST_BG = "#323232"
+_COLOR_TEXT_PRIMARY = "#1B1A19"
+_COLOR_TEXT_SECONDARY = "#605E5C"
+_COLOR_SEPARATOR = "#E1DFDD"
+_COLOR_WARNING_BG = "#FFF4CE"
+_COLOR_WARNING_FG = "#605E5C"
+_COLOR_TOAST_BG = "#323130"
 _COLOR_TOAST_FG = "#FFFFFF"
-_COLOR_TEXT_WIDGET_BG = "#FAFAFA"
-_COLOR_TEXT_WIDGET_SELECT = "#B3D7FF"
+_COLOR_TEXT_WIDGET_BG = "#FAF9F8"
+_COLOR_TEXT_WIDGET_SELECT = "#C7E0F4"
+_COLOR_HEADER_ACCENT_1 = "#8CCBFF"
+_COLOR_HEADER_ACCENT_2 = "#D0E7FF"
 
 _FONT_HEADING = ("Segoe UI", 15, "bold")
 _FONT_SUBHEADING = ("Segoe UI", 11)
@@ -103,6 +105,7 @@ _FONT_STEP = ("Segoe UI", 9)
 _PAD = 16
 _BUTTON_PAD = 4
 _BUTTON_WIDTH = 13
+_APP_ICON_IMAGE: tk.PhotoImage | None = None
 
 
 def _setup_styles(root: tk.Tk) -> None:
@@ -125,7 +128,7 @@ def _setup_styles(root: tk.Tk) -> None:
                      font=_FONT_HEADING)
     style.configure("HeaderSub.TLabel", background=_COLOR_HEADER_BG, foreground=_COLOR_HEADER_FG,
                      font=_FONT_SUBHEADING)
-    style.configure("Step.TLabel", background=_COLOR_HEADER_BG, foreground="#B0D4F1",
+    style.configure("Step.TLabel", background=_COLOR_HEADER_BG, foreground="#D6ECFF",
                      font=_FONT_STEP)
     style.configure("Content.TLabel", background=_COLOR_CONTENT_BG, foreground=_COLOR_TEXT_PRIMARY,
                      font=_FONT_BODY)
@@ -149,6 +152,22 @@ def _setup_styles(root: tk.Tk) -> None:
 # Reusable dialog building blocks
 # ---------------------------------------------------------------------------
 
+def _ensure_app_icon(root: tk.Tk) -> None:
+    """Apply a small playful custom icon to top-left window chrome."""
+    global _APP_ICON_IMAGE
+    try:
+        if _APP_ICON_IMAGE is None:
+            img = tk.PhotoImage(master=root, width=16, height=16)
+            img.put("#0F6CBD", to=(0, 0, 16, 16))
+            img.put("#FFFFFF", to=(3, 3, 13, 13))
+            img.put("#0F6CBD", to=(5, 5, 11, 6))
+            img.put("#0F6CBD", to=(5, 8, 11, 9))
+            img.put("#0F6CBD", to=(5, 11, 11, 12))
+            _APP_ICON_IMAGE = img
+        root.iconphoto(True, _APP_ICON_IMAGE)
+    except Exception:
+        pass
+
 def _build_header(parent: tk.Toplevel, title: str, subtitle: str = "",
                   step: str = "") -> ttk.Frame:
     """Build a colored header banner at the top of a dialog."""
@@ -167,6 +186,11 @@ def _build_header(parent: tk.Toplevel, title: str, subtitle: str = "",
     if subtitle:
         ttk.Label(inner, text=subtitle, style="HeaderSub.TLabel",
                   wraplength=800).pack(fill="x", pady=(4, 0), anchor="w")
+
+    accents = tk.Canvas(header, height=8, bg=_COLOR_HEADER_BG, highlightthickness=0, bd=0)
+    accents.pack(fill="x", side="bottom")
+    accents.create_rectangle(0, 0, 1000, 1, fill=_COLOR_HEADER_ACCENT_1, outline="")
+    accents.create_rectangle(0, 2, 1000, 3, fill=_COLOR_HEADER_ACCENT_2, outline="")
 
     return header
 
@@ -233,6 +257,7 @@ def _format_azure_setup_inline_message(context: str, error: AzureSetupGuidanceEr
 
 def _activate_modal_dialog(dialog: tk.Toplevel, root: tk.Tk) -> None:
     """Show dialog reliably even when the root window is withdrawn."""
+    _ensure_app_icon(dialog)
     if root.winfo_viewable():
         dialog.transient(root)
     dialog.grab_set()
@@ -311,6 +336,55 @@ def _format_eta(seconds: float) -> str:
     return f"{secs}s"
 
 
+def _estimate_remaining_seconds(
+    *,
+    total_notes: int,
+    done: int,
+    elapsed_seconds: float,
+    estimated_seconds: float | None,
+    progress_samples: list[tuple[float, int]],
+) -> float:
+    """Estimate remaining time using observed throughput with baseline backoff."""
+    if done <= 0 or total_notes <= 0:
+        if estimated_seconds is None:
+            return 0.0
+        return max(estimated_seconds - elapsed_seconds, 0.0)
+
+    remaining_items = max(total_notes - done, 0)
+    if remaining_items == 0:
+        return 0.0
+
+    elapsed_seconds = max(elapsed_seconds, 1e-6)
+    overall_rate = done / elapsed_seconds
+    if overall_rate <= 0:
+        return 0.0
+
+    recent_rate = overall_rate
+    if len(progress_samples) >= 2:
+        latest_t, latest_done = progress_samples[-1]
+        earliest_t, earliest_done = progress_samples[0]
+        delta_t = max(latest_t - earliest_t, 0.0)
+        delta_done = max(latest_done - earliest_done, 0)
+        if delta_t > 0 and delta_done > 0:
+            recent_rate = delta_done / delta_t
+
+    effective_rate = (0.65 * recent_rate) + (0.35 * overall_rate)
+    dynamic_remaining = remaining_items / max(effective_rate, 1e-6)
+
+    if estimated_seconds is None:
+        return dynamic_remaining
+
+    baseline_remaining = max(estimated_seconds - elapsed_seconds, 0.0)
+    progress_ratio = done / max(total_notes, 1)
+    baseline_weight = max(0.0, 1.0 - (2.0 * progress_ratio))
+    if done >= max(3, int(total_notes * 0.05)):
+        baseline_weight = min(baseline_weight, 0.25)
+
+    return (baseline_weight * baseline_remaining) + (
+        (1.0 - baseline_weight) * dynamic_remaining
+    )
+
+
 def _enable_right_click_copy(text_widget: tk.Text, parent: tk.Misc) -> None:
     def _copy_selection(_event: tk.Event | None = None) -> str | None:
         try:
@@ -343,6 +417,7 @@ def run_gui_wizard(
 ) -> None:
     """Run the full GUI wizard flow."""
     root = tk.Tk()
+    _ensure_app_icon(root)
     root.withdraw()
     _setup_styles(root)
     client_id = default_client_id
@@ -357,7 +432,21 @@ def run_gui_wizard(
                 return
 
             selected_files = [welcome_result]
-            all_sections, total_notes = _parse_selected_enex_files(selected_files)
+            try:
+                all_sections, total_notes = _parse_selected_enex_files(selected_files)
+            except Exception as e:
+                logger.exception("Failed to parse ENEX file: %s", welcome_result)
+                messagebox.showerror(
+                    "Failed to Read ENEX",
+                    (
+                        "Could not parse the selected .enex file.\n\n"
+                        f"File: {welcome_result}\n\n"
+                        f"Details: {e}\n\n"
+                        "Please select another file or re-export from Evernote."
+                    ),
+                    parent=root,
+                )
+                continue
             _maybe_warn_multipart_size_risks(root, all_sections)
 
             # Step 2: Note Preview
@@ -369,6 +458,7 @@ def run_gui_wizard(
 
             # Step 3: Azure Setup + Authentication
             azure_inline_message = ""
+            restart_requested = False
             while True:
                 client_result = _show_azure_setup_dialog(root, client_id, azure_inline_message)
                 if client_result is None:
@@ -444,7 +534,23 @@ def run_gui_wizard(
                     )
                     if upload_summary.get("aborted"):
                         return
-                    return
+                    if _prompt_upload_another_file(
+                        root,
+                        notebook_name=notebook_name,
+                        notebook_url=notebook_url,
+                        upload_summary=upload_summary,
+                        total_notes=total_notes,
+                    ):
+                        restart_requested = True
+                    else:
+                        return
+                    break
+
+                if restart_requested:
+                    break
+
+            if restart_requested:
+                continue
 
     finally:
         try:
@@ -456,6 +562,40 @@ def run_gui_wizard(
 # ---------------------------------------------------------------------------
 # Dialogs
 # ---------------------------------------------------------------------------
+
+def _prompt_upload_another_file(
+    root: tk.Tk,
+    notebook_name: str,
+    notebook_url: str,
+    upload_summary: dict[str, int | bool],
+    total_notes: int,
+) -> bool:
+    uploaded_notes = int(upload_summary.get("uploaded_notes", 0))
+    replaced_pages = int(upload_summary.get("replaced_pages", 0))
+    skipped_duplicates = int(upload_summary.get("skipped_duplicates", 0))
+    skipped_oversized = int(upload_summary.get("skipped_oversized", 0))
+    errors_count = int(upload_summary.get("errors_count", 0))
+
+    lines = [
+        "Import finished.",
+        "",
+        f"Notebook: {notebook_name}",
+        f"Uploaded: {uploaded_notes}/{total_notes}",
+        f"Replaced duplicate pages: {replaced_pages}",
+        f"Skipped duplicates: {skipped_duplicates}",
+        f"Skipped oversized notes: {skipped_oversized}",
+        f"Errors: {errors_count}",
+    ]
+    if notebook_url:
+        lines.extend(["", f"Notebook link: {notebook_url}"])
+    lines.extend(["", "Do you want to import another .enex file now?"])
+
+    return messagebox.askyesno(
+        "Import Finished",
+        "\n".join(lines),
+        parent=root,
+    )
+
 
 def _maybe_alert_update_available(root: tk.Tk) -> None:
     """Show a startup prompt if a newer release is available."""
@@ -1159,27 +1299,28 @@ def _upload_with_progress_window(
         "skipped_oversized": 0,
         "errors_count": 0,
     }
+    progress_samples: list[tuple[float, int]] = []
 
     def _refresh_progress_details(force_complete: bool = False) -> None:
         done = int(progress_snapshot.get("done", 0))
         uploaded = int(progress_snapshot.get("uploaded_notes", 0))
         elapsed_seconds = max(time.monotonic() - progress_started_at, 0.0)
+        progress_samples.append((elapsed_seconds, done))
+        progress_samples[:] = progress_samples[-60:]
 
         processed_pct = int((done / max(total_notes, 1)) * 100)
         uploaded_pct = int((uploaded / max(total_notes, 1)) * 100)
 
         if force_complete:
             remaining_seconds = 0.0
-        elif done > 0:
-            observed_total = (elapsed_seconds * total_notes) / done
-            total_estimate = observed_total
-            if estimated_seconds is not None:
-                total_estimate = max(total_estimate, estimated_seconds)
-            remaining_seconds = max(total_estimate - elapsed_seconds, 0.0)
-        elif estimated_seconds is not None:
-            remaining_seconds = max(estimated_seconds - elapsed_seconds, 0.0)
         else:
-            remaining_seconds = 0.0
+            remaining_seconds = _estimate_remaining_seconds(
+                total_notes=total_notes,
+                done=done,
+                elapsed_seconds=elapsed_seconds,
+                estimated_seconds=estimated_seconds,
+                progress_samples=progress_samples,
+            )
 
         progress_detail_var.set(
             "Uploaded: "

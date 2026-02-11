@@ -165,6 +165,34 @@ class TestParseEnexSynthetic:
             assert note.resources == []
 
 
+def test_parse_enex_handles_huge_text_nodes():
+    huge_text = "A" * (11 * 1024 * 1024)
+    enex = f"""\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE en-export SYSTEM "http://xml.evernote.com/pub/evernote-export4.dtd">
+<en-export export-date="20260101T000000Z" application="Evernote" version="10.0">
+  <note>
+    <title>Huge Note</title>
+    <created>20250101T120000Z</created>
+    <updated>20250102T120000Z</updated>
+    <content><![CDATA[<en-note><div>{huge_text}</div></en-note>]]></content>
+  </note>
+</en-export>
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".enex", delete=False) as tmp:
+        tmp.write(enex)
+        tmp_path = tmp.name
+
+    try:
+        notes = parse_enex(tmp_path)
+    finally:
+        os.unlink(tmp_path)
+
+    assert len(notes) == 1
+    assert notes[0].title == "Huge Note"
+    assert len(notes[0].content_enml) > (10 * 1024 * 1024)
+
+
 # ---------------------------------------------------------------------------
 # Test: ENML-to-HTML conversion
 # ---------------------------------------------------------------------------

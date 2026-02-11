@@ -143,8 +143,22 @@ def _run_gui_mode(args: argparse.Namespace) -> None:
     try:
         from gui_wizard import run_gui_wizard
     except Exception as e:
-        logger.warning("GUI mode unavailable (%s). Falling back to terminal wizard.", e)
-        _run_interactive_mode(args)
+        if _can_use_terminal_input():
+            logger.warning("GUI mode unavailable (%s). Falling back to terminal wizard.", e)
+            try:
+                _run_interactive_mode(args)
+            except Exception as fallback_error:
+                logger.exception("Terminal fallback failed after GUI import failure.")
+                _show_gui_runtime_error(
+                    "GUI mode failed to start and terminal fallback also failed.",
+                    fallback_error,
+                )
+            return
+        logger.exception("GUI mode unavailable and no interactive stdin for fallback.")
+        _show_gui_runtime_error(
+            "GUI mode failed to start and terminal fallback is unavailable.",
+            e,
+        )
         return
 
     try:
@@ -156,8 +170,56 @@ def _run_gui_mode(args: argparse.Namespace) -> None:
             verbose=args.verbose,
         )
     except Exception as e:
-        logger.warning("GUI mode failed at runtime (%s). Falling back to terminal wizard.", e)
-        _run_interactive_mode(args)
+        if _can_use_terminal_input():
+            logger.warning("GUI mode failed at runtime (%s). Falling back to terminal wizard.", e)
+            try:
+                _run_interactive_mode(args)
+            except Exception as fallback_error:
+                logger.exception("Terminal fallback failed after GUI runtime failure.")
+                _show_gui_runtime_error(
+                    "GUI mode failed, and terminal fallback also failed.",
+                    fallback_error,
+                )
+            return
+        logger.exception("GUI mode failed at runtime and no interactive stdin for fallback.")
+        _show_gui_runtime_error(
+            "GUI mode encountered an unexpected error and terminal fallback is unavailable.",
+            e,
+        )
+
+
+def _can_use_terminal_input() -> bool:
+    """Return True when stdin is available for interactive terminal prompts."""
+    stdin = getattr(sys, "stdin", None)
+    if stdin is None:
+        return False
+    if getattr(stdin, "closed", False):
+        return False
+    try:
+        return bool(stdin.isatty())
+    except Exception:
+        return False
+
+
+def _show_gui_runtime_error(message: str, error: Exception) -> None:
+    """Show a best-effort GUI error dialog for windowed builds without stdin."""
+    detail = f"{message}\n\nDetails:\n{error}"
+    dialog_root = None
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+
+        dialog_root = tk.Tk()
+        dialog_root.withdraw()
+        messagebox.showerror("Evernote to OneNote Wizard", detail, parent=dialog_root)
+    except Exception:
+        logger.error("%s | %s", message, error)
+    finally:
+        if dialog_root is not None:
+            try:
+                dialog_root.destroy()
+            except Exception:
+                pass
 
 
 def _run_interactive_mode(args: argparse.Namespace) -> None:

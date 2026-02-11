@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
 echo ============================================================
@@ -41,7 +41,7 @@ echo.
 echo Building with:
 echo   %PY%
 call scripts\build_windows_exe.bat "%PY%"
-if errorlevel 1 (
+if not "!ERRORLEVEL!"=="0" (
   echo Build failed.
   pause
   exit /b 1

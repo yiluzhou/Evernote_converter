@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal EnableExtensions EnableDelayedExpansion
 
 REM Build standalone Windows GUI executable (single .exe in project root)
 REM Run this on Windows from the project root.
@@ -34,13 +34,21 @@ if "%~1"=="" (
 )
 
 %PY% -c "import sys" >nul 2>&1
-if errorlevel 1 (
+if not "!ERRORLEVEL!"=="0" (
   echo Python command failed: %PY%
   exit /b 1
 )
 
 %PY% -m pip install --upgrade pip
+if not "!ERRORLEVEL!"=="0" (
+  echo pip upgrade failed.
+  exit /b 1
+)
 %PY% -m pip install -r requirements.txt pyinstaller
+if not "!ERRORLEVEL!"=="0" (
+  echo Dependency install failed.
+  exit /b 1
+)
 
 %PY% -m PyInstaller ^
   --noconfirm ^
@@ -57,7 +65,7 @@ if errorlevel 1 (
   --specpath build\pyinstaller ^
   --name EvernoteToOneNoteWizard ^
   src/main.py
-if errorlevel 1 (
+if not "!ERRORLEVEL!"=="0" (
   echo PyInstaller build failed.
   exit /b 1
 )

@@ -20,6 +20,7 @@ if "msal" not in sys.modules:
 
 from main import (  # noqa: E402
     _determine_mode,
+    _run_gui_mode,
     _upload_sections,
     _parse_index_selection,
     _resolve_requested_enex_files,
@@ -146,3 +147,65 @@ def test_upload_sections_skips_oversized_note_without_aborting():
     )
 
     assert uploader.created_pages == 1
+
+
+def test_run_gui_mode_no_stdin_shows_error_instead_of_terminal_fallback(monkeypatch):
+    class _NoStdin:
+        closed = False
+
+        @staticmethod
+        def isatty():
+            return False
+
+    def _raise_runtime(**_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setitem(sys.modules, "gui_wizard", types.SimpleNamespace(run_gui_wizard=_raise_runtime))
+    monkeypatch.setattr(sys, "stdin", _NoStdin())
+
+    calls = {"interactive": 0, "error": 0}
+    monkeypatch.setattr("main._run_interactive_mode", lambda _args: calls.__setitem__("interactive", 1))
+    monkeypatch.setattr("main._show_gui_runtime_error", lambda _msg, _err: calls.__setitem__("error", 1))
+
+    args = argparse.Namespace(
+        enex_dir=None,
+        notebook_name="Notebook",
+        client_id=None,
+        dry_run=False,
+        verbose=False,
+    )
+    _run_gui_mode(args)
+
+    assert calls["interactive"] == 0
+    assert calls["error"] == 1
+
+
+def test_run_gui_mode_terminal_fallback_when_stdin_available(monkeypatch):
+    class _TtyStdin:
+        closed = False
+
+        @staticmethod
+        def isatty():
+            return True
+
+    def _raise_runtime(**_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setitem(sys.modules, "gui_wizard", types.SimpleNamespace(run_gui_wizard=_raise_runtime))
+    monkeypatch.setattr(sys, "stdin", _TtyStdin())
+
+    calls = {"interactive": 0, "error": 0}
+    monkeypatch.setattr("main._run_interactive_mode", lambda _args: calls.__setitem__("interactive", 1))
+    monkeypatch.setattr("main._show_gui_runtime_error", lambda _msg, _err: calls.__setitem__("error", 1))
+
+    args = argparse.Namespace(
+        enex_dir=None,
+        notebook_name="Notebook",
+        client_id=None,
+        dry_run=False,
+        verbose=False,
+    )
+    _run_gui_mode(args)
+
+    assert calls["interactive"] == 1
+    assert calls["error"] == 0
