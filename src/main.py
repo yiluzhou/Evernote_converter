@@ -18,6 +18,7 @@ import argparse
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 from tqdm import tqdm
@@ -41,6 +42,7 @@ DEFAULT_NOTEBOOK_NAME = "Evernote Import"
 DEFAULT_ENEX_DIR = "enex"
 WIZARD_TOTAL_STEPS = 6
 _MULTIPART_CHECK_DISPLAY_LIMIT = 8
+NOTE_UPLOAD_WAIT_SECONDS = 2.0
 
 
 def main() -> None:
@@ -358,7 +360,10 @@ def _authenticate_uploader(client_id: str) -> OneNoteUploader:
     print("Authenticating with Microsoft Graph...")
     try:
         token = get_graph_token(client_id)
-        return OneNoteUploader(token)
+        return OneNoteUploader(
+            token,
+            token_refresh_callback=lambda: get_graph_token(client_id, silent_only=True),
+        )
     except AzureSetupGuidanceError as e:
         print("")
         print("Azure setup issue detected:")
@@ -719,6 +724,7 @@ def _upload_sections(
     skipped_oversized = 0
     replaced_pages = 0
     duplicate_policy: str | None = None  # replace_all / skip_all
+    processed_any_note = False
 
     with tqdm(total=total_notes, desc="Uploading notes") as pbar:
         for section_name, notes in all_sections.items():
@@ -739,6 +745,9 @@ def _upload_sections(
                 )
 
             for note in notes:
+                if processed_any_note and NOTE_UPLOAD_WAIT_SECONDS > 0:
+                    time.sleep(NOTE_UPLOAD_WAIT_SECONDS)
+
                 fallback_identity = uploader.page_identity_from_note(note)
                 duplicate_pages = _collect_duplicate_pages(
                     note,
@@ -829,6 +838,7 @@ def _upload_sections(
                         tqdm.write(f"  ERROR: '{note.title}': {e}")
 
                 pbar.update(1)
+                processed_any_note = True
 
     print(f"\nDone! {uploaded_notes}/{total_notes} notes uploaded.")
     if replaced_pages:

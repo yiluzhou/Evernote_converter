@@ -6,6 +6,7 @@ import types
 from datetime import datetime
 
 import pytest
+import requests
 
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -26,15 +27,23 @@ from onenote_uploader import (
     OneNoteRequestSizeLimitError,
     _classify_azure_setup_error,
     analyze_note_multipart_limits,
+    get_graph_token,
     is_probable_request_size_error,
 )
 
 
 class _FakeResponse:
-    def __init__(self, payload: dict | None = None, text: str = "", status_code: int = 200):
+    def __init__(
+        self,
+        payload: dict | None = None,
+        text: str = "",
+        status_code: int = 200,
+        headers: dict | None = None,
+    ):
         self._payload = payload
         self.text = text
         self.status_code = status_code
+        self.headers = headers or {}
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
@@ -233,6 +242,75 @@ def test_raise_for_status_with_guidance_falls_back_to_http_error():
         assert "HTTP 500" in str(e)
 
 
+def test_delete_page_treats_404_as_already_deleted(monkeypatch):
+    uploader = OneNoteUploader("token")
+    uploader._page_guid_cache["page-404"] = "guid"
+    uploader._page_url_cache["page-404"] = "https://example.test/page"
+
+    def _raise_404(*args, **kwargs):
+        resp = requests.Response()
+        resp.status_code = 404
+        resp.url = "https://graph.microsoft.com/v1.0/me/onenote/pages/page-404"
+        raise requests.HTTPError("404", response=resp)
+
+    monkeypatch.setattr(uploader, "_request_no_content_with_retry", _raise_404)
+
+    uploader.delete_page("page-404")
+
+    assert "page-404" not in uploader._page_guid_cache
+    assert "page-404" not in uploader._page_url_cache
+
+
+def test_delete_page_re_raises_non_404_http_error(monkeypatch):
+    uploader = OneNoteUploader("token")
+
+    def _raise_500(*args, **kwargs):
+        resp = requests.Response()
+        resp.status_code = 500
+        resp.url = "https://graph.microsoft.com/v1.0/me/onenote/pages/page-500"
+        raise requests.HTTPError("500", response=resp)
+
+    monkeypatch.setattr(uploader, "_request_no_content_with_retry", _raise_500)
+
+    with pytest.raises(requests.HTTPError):
+        uploader.delete_page("page-500")
+
+
+def test_request_with_retry_refreshes_token_on_401(monkeypatch):
+    class _Session401ThenOK:
+        def __init__(self):
+            self.calls = 0
+            self.headers = {"Authorization": "Bearer old-token"}
+
+        def request(self, method: str, url: str, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _FakeResponse(
+                    payload={
+                        "error": {
+                            "code": "InvalidAuthenticationToken",
+                            "message": "Access token has expired.",
+                        }
+                    },
+                    status_code=401,
+                    text='{"error":{"code":"InvalidAuthenticationToken"}}',
+                )
+            return _FakeResponse(payload={"id": "page-123"}, status_code=201, text='{"id":"page-123"}')
+
+    uploader = OneNoteUploader(
+        "old-token",
+        token_refresh_callback=lambda: "new-token",
+    )
+    uploader.session = _Session401ThenOK()
+    monkeypatch.setattr(uploader, "_apply_client_side_write_rate_limit", lambda: None)
+
+    payload = uploader._request_with_retry("POST", "https://example.test/pages")
+
+    assert payload["id"] == "page-123"
+    assert uploader.session.calls == 2
+    assert uploader.session.headers["Authorization"] == "Bearer new-token"
+
+
 def test_get_graph_token_device_flow_callback_receives_flow(monkeypatch, tmp_path):
     class _FakeCache:
         def deserialize(self, _text):
@@ -285,6 +363,44 @@ def test_get_graph_token_device_flow_callback_receives_flow(monkeypatch, tmp_pat
 
     assert token == "token-123"
     assert seen.get("user_code") == "ABCD-1234"
+
+
+def test_get_graph_token_silent_only_raises_when_cache_has_no_valid_session(monkeypatch, tmp_path):
+    class _FakeCache:
+        def deserialize(self, _text):
+            return None
+
+        def serialize(self):
+            return "{}"
+
+    class _FakeApp:
+        def __init__(self, client_id, authority, token_cache):
+            self.client_id = client_id
+            self.authority = authority
+            self.token_cache = token_cache
+
+        def get_accounts(self):
+            return []
+
+        def initiate_device_flow(self, scopes):  # pragma: no cover
+            raise AssertionError("silent_only should not start device flow")
+
+    monkeypatch.setattr(
+        sys.modules["onenote_uploader"].msal,
+        "SerializableTokenCache",
+        _FakeCache,
+    )
+    monkeypatch.setattr(
+        sys.modules["onenote_uploader"].msal,
+        "PublicClientApplication",
+        _FakeApp,
+    )
+    monkeypatch.setattr(sys.modules["onenote_uploader"], "CACHE_FILE", str(tmp_path / "cache.json"))
+
+    with pytest.raises(AzureSetupGuidanceError) as exc:
+        get_graph_token("client-id", silent_only=True)
+
+    assert "expired" in str(exc.value.title).lower() or "authorization" in str(exc.value.title).lower()
 
 
 def test_analyze_note_multipart_limits_reports_hard_violations(monkeypatch):

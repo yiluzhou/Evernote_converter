@@ -68,6 +68,7 @@ _PREVIEW_MAX_NOTES = 24
 _PREVIEW_NOTES_PER_SECTION = 4
 _PREVIEW_SNIPPET_CHARS = 240
 _MULTIPART_CHECK_DISPLAY_LIMIT = 8
+NOTE_UPLOAD_WAIT_SECONDS = 2.0
 _ACTION_PREVIOUS = "__previous__"
 _ACTION_NEXT = "__next__"
 
@@ -929,7 +930,13 @@ def _authenticate_with_busy_dialog(
                 client_id,
                 device_flow_callback=lambda flow: events.put(("device_flow", flow)),
             )
-            events.put(("ok", OneNoteUploader(token)))
+            events.put((
+                "ok",
+                OneNoteUploader(
+                    token,
+                    token_refresh_callback=lambda: get_graph_token(client_id, silent_only=True),
+                ),
+            ))
         except AzureSetupGuidanceError as e:
             events.put(("azure", e))
         except Exception as e:
@@ -1283,9 +1290,15 @@ def _upload_with_progress_window(
     sep.pack(fill="x", side="bottom")
     button_bar = ttk.Frame(progress, style="ButtonBar.TFrame")
     button_bar.pack(fill="x", padx=_PAD, pady=10, side="bottom")
-    close_button = ttk.Button(button_bar, text="Close", style="Accent.TButton")
-    close_button.pack(side="right", padx=_BUTTON_PAD)
-    close_button.state(["disabled"])
+    pause_button = ttk.Button(button_bar, text="Pause", style="TButton")
+    pause_button.pack(side="left", padx=_BUTTON_PAD)
+    resume_button = ttk.Button(button_bar, text="Resume", style="TButton")
+    resume_button.pack(side="left", padx=_BUTTON_PAD)
+    stop_button = ttk.Button(button_bar, text="Stop", style="TButton")
+    stop_button.pack(side="right", padx=_BUTTON_PAD)
+    exit_button = ttk.Button(button_bar, text="Exit", style="Accent.TButton")
+    exit_button.pack(side="right", padx=_BUTTON_PAD)
+    resume_button.state(["disabled"])
 
     # Queue for worker -> UI events
     ui_queue: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -1300,11 +1313,23 @@ def _upload_with_progress_window(
         "errors_count": 0,
     }
     progress_samples: list[tuple[float, int]] = []
+    pause_event = threading.Event()
+    pause_event.set()
+    stop_event = threading.Event()
+    paused_since: dict[str, float | None] = {"value": None}
+    paused_total_seconds = {"value": 0.0}
+    worker_done = {"value": False}
+    exit_after_stop = {"value": False}
+    can_close = {"value": False}
 
     def _refresh_progress_details(force_complete: bool = False) -> None:
         done = int(progress_snapshot.get("done", 0))
         uploaded = int(progress_snapshot.get("uploaded_notes", 0))
-        elapsed_seconds = max(time.monotonic() - progress_started_at, 0.0)
+        now = time.monotonic()
+        paused_seconds = paused_total_seconds["value"]
+        if paused_since["value"] is not None:
+            paused_seconds += max(now - paused_since["value"], 0.0)
+        elapsed_seconds = max((now - progress_started_at) - paused_seconds, 0.0)
         progress_samples.append((elapsed_seconds, done))
         progress_samples[:] = progress_samples[-60:]
 
@@ -1331,6 +1356,87 @@ def _upload_with_progress_window(
             f"Remaining: {_format_eta(remaining_seconds)}"
         )
 
+    def _mark_pause_started() -> None:
+        if paused_since["value"] is None:
+            paused_since["value"] = time.monotonic()
+
+    def _mark_pause_ended() -> None:
+        if paused_since["value"] is not None:
+            paused_total_seconds["value"] += max(
+                time.monotonic() - paused_since["value"],
+                0.0,
+            )
+            paused_since["value"] = None
+
+    def _pause_upload() -> None:
+        if worker_done["value"] or stop_event.is_set():
+            return
+        if not pause_event.is_set():
+            return
+        pause_event.clear()
+        _mark_pause_started()
+        pause_button.state(["disabled"])
+        resume_button.state(["!disabled"])
+        status_var.set("Paused. Click Resume to continue.")
+        text.insert(tk.END, "Paused by user.\n")
+        text.see(tk.END)
+        _refresh_progress_details()
+
+    def _resume_upload() -> None:
+        if worker_done["value"] or stop_event.is_set():
+            return
+        if pause_event.is_set():
+            return
+        pause_event.set()
+        _mark_pause_ended()
+        pause_button.state(["!disabled"])
+        resume_button.state(["disabled"])
+        status_var.set("Resuming upload...")
+        text.insert(tk.END, "Resumed by user.\n")
+        text.see(tk.END)
+        _refresh_progress_details()
+
+    def _stop_upload() -> None:
+        if worker_done["value"] or stop_event.is_set():
+            return
+        stop_event.set()
+        pause_event.set()
+        _mark_pause_ended()
+        pause_button.state(["disabled"])
+        resume_button.state(["disabled"])
+        stop_button.state(["disabled"])
+        status_var.set("Stopping after current request...")
+        text.insert(tk.END, "Stop requested by user. Waiting for current request to finish...\n")
+        text.see(tk.END)
+
+    def _close_window_now() -> None:
+        try:
+            progress.destroy()
+        except Exception:
+            pass
+
+    def _exit_upload() -> None:
+        if can_close["value"] or worker_done["value"]:
+            _close_window_now()
+            return
+
+        should_exit = messagebox.askyesno(
+            "Exit Upload",
+            "Stop current upload and close this window?",
+            parent=progress,
+        )
+        if not should_exit:
+            return
+
+        exit_after_stop["value"] = True
+        _stop_upload()
+        status_var.set("Stopping and exiting after current request...")
+
+    pause_button.configure(command=_pause_upload)
+    resume_button.configure(command=_resume_upload)
+    stop_button.configure(command=_stop_upload)
+    exit_button.configure(command=_exit_upload)
+
     def _worker() -> None:
         errors: list[tuple[str, str]] = []
         uploaded_notes = 0
@@ -1339,6 +1445,7 @@ def _upload_with_progress_window(
         replaced_pages = 0
         duplicate_policy: str | None = None
         current_done = 0
+        processed_any_note = False
 
         def _emit_progress() -> None:
             ui_queue.put(("progress", {
@@ -1357,9 +1464,24 @@ def _upload_with_progress_window(
                 "replaced_pages": replaced_pages,
                 "errors_count": len(errors) + extra_errors,
                 "aborted": aborted,
+                "stopped_by_user": bool(aborted and stop_event.is_set()),
             }
 
+        def _wait_for_resume_or_stop() -> bool:
+            while True:
+                if stop_event.is_set():
+                    return True
+                if pause_event.is_set():
+                    return False
+                time.sleep(0.1)
+
+        def _abort_due_to_user_stop() -> None:
+            ui_queue.put(("done", _make_summary(aborted=True)))
+
         for section_name, notes in all_sections.items():
+            if _wait_for_resume_or_stop():
+                _abort_due_to_user_stop()
+                return
             ui_queue.put(("status", f"Section: {section_name}"))
 
             try:
@@ -1393,6 +1515,20 @@ def _upload_with_progress_window(
                 ui_queue.put(("log", f"  Scanned {existing_count} existing page(s) for duplicate detection"))
 
             for note in notes:
+                if processed_any_note and NOTE_UPLOAD_WAIT_SECONDS > 0:
+                    ui_queue.put(("status", f"Waiting {int(NOTE_UPLOAD_WAIT_SECONDS)}s before next note..."))
+                    remaining_wait = NOTE_UPLOAD_WAIT_SECONDS
+                    while remaining_wait > 0:
+                        if _wait_for_resume_or_stop():
+                            _abort_due_to_user_stop()
+                            return
+                        step_wait = min(0.1, remaining_wait)
+                        time.sleep(step_wait)
+                        remaining_wait -= step_wait
+
+                if _wait_for_resume_or_stop():
+                    _abort_due_to_user_stop()
+                    return
                 ui_queue.put(("status", f"Uploading note: {note.title}"))
 
                 fallback_identity = uploader.page_identity_from_note(note)
@@ -1429,6 +1565,9 @@ def _upload_with_progress_window(
                     if action == "replace":
                         delete_failed = False
                         for page in duplicate_pages:
+                            if _wait_for_resume_or_stop():
+                                _abort_due_to_user_stop()
+                                return
                             page_id = page.get("id", "")
                             if not page_id:
                                 continue
@@ -1494,6 +1633,7 @@ def _upload_with_progress_window(
 
                 current_done += 1
                 _emit_progress()
+                processed_any_note = True
 
         ui_queue.put(("done", _make_summary()))
 
@@ -1506,19 +1646,9 @@ def _upload_with_progress_window(
         "replaced_pages": 0,
         "errors_count": 0,
         "aborted": True,
+        "stopped_by_user": False,
     }
-    can_close = {"value": False}
-
-    def _close_window() -> None:
-        if not can_close["value"]:
-            return
-        try:
-            progress.destroy()
-        except Exception:
-            pass
-
-    close_button.configure(command=_close_window)
-    progress.protocol("WM_DELETE_WINDOW", _close_window)
+    progress.protocol("WM_DELETE_WINDOW", _exit_upload)
 
     def _poll_queue() -> None:
         nonlocal final_result
@@ -1561,7 +1691,11 @@ def _upload_with_progress_window(
             elif event_type == "azure_error":
                 error, context, summary = payload
                 final_result = summary
+                worker_done["value"] = True
                 can_close["value"] = True
+                pause_button.state(["disabled"])
+                resume_button.state(["disabled"])
+                stop_button.state(["disabled"])
                 try:
                     progress.destroy()
                 except Exception:
@@ -1570,15 +1704,33 @@ def _upload_with_progress_window(
                 return
             elif event_type == "done":
                 final_result = payload
-                status_var.set("Upload complete. Review summary, then click Close.")
+                worker_done["value"] = True
+                can_close["value"] = True
+                _mark_pause_ended()
+                pause_button.state(["disabled"])
+                resume_button.state(["disabled"])
+                stop_button.state(["disabled"])
+                exit_button.configure(text="Close")
+
+                stopped_by_user = bool(final_result.get("stopped_by_user", False))
+                if stopped_by_user:
+                    status_var.set("Upload stopped by user. Review summary, then click Close.")
+                else:
+                    status_var.set("Upload complete. Review summary, then click Close.")
+
                 progress_snapshot.update({
-                    "done": total_notes,
                     "uploaded_notes": int(final_result["uploaded_notes"]),
                     "skipped_duplicates": int(final_result["skipped_duplicates"]),
                     "skipped_oversized": int(final_result["skipped_oversized"]),
                     "errors_count": int(final_result["errors_count"]),
                 })
-                text.insert(tk.END, "\nUpload complete.\n")
+                if not stopped_by_user:
+                    progress_snapshot["done"] = total_notes
+
+                text.insert(
+                    tk.END,
+                    "\nUpload stopped by user.\n" if stopped_by_user else "\nUpload complete.\n",
+                )
                 text.insert(tk.END, f"Uploaded: {final_result['uploaded_notes']}/{total_notes}\n")
                 text.insert(tk.END, f"Replaced duplicate pages: {final_result['replaced_pages']}\n")
                 text.insert(tk.END, f"Skipped duplicates: {final_result['skipped_duplicates']}\n")
@@ -1587,12 +1739,21 @@ def _upload_with_progress_window(
                 if notebook_url:
                     text.insert(tk.END, f"Notebook link: {notebook_url}\n")
                 text.see(tk.END)
-                progress_var.set(max(total_notes, 1))
-                pct_label.configure(text="100%")
-                _refresh_progress_details(force_complete=True)
-                can_close["value"] = True
-                close_button.state(["!disabled"])
-                close_button.focus_set()
+                if not stopped_by_user:
+                    progress_var.set(max(total_notes, 1))
+                    pct_label.configure(text="100%")
+                    _refresh_progress_details(force_complete=True)
+                else:
+                    current_done = int(progress_snapshot.get("done", 0))
+                    progress_var.set(current_done)
+                    pct = int((current_done / max(total_notes, 1)) * 100)
+                    pct_label.configure(text=f"{pct}%")
+                    _refresh_progress_details()
+                exit_button.focus_set()
+
+                if exit_after_stop["value"]:
+                    _close_window_now()
+                    return
                 return
 
         _refresh_progress_details()

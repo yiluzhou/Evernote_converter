@@ -25,6 +25,7 @@ from main import (  # noqa: E402
     _parse_index_selection,
     _resolve_requested_enex_files,
 )
+import main as main_module  # noqa: E402
 from enex_parser import EvernoteNote  # noqa: E402
 from onenote_uploader import OneNoteRequestSizeLimitError  # noqa: E402
 
@@ -105,7 +106,7 @@ def test_determine_mode_advanced_flag():
     assert _determine_mode(args, ["--advanced"]) == "advanced"
 
 
-def test_upload_sections_skips_oversized_note_without_aborting():
+def test_upload_sections_skips_oversized_note_without_aborting(monkeypatch):
     class _Uploader:
         def __init__(self):
             self.created_pages = 0
@@ -138,6 +139,8 @@ def test_upload_sections_skips_oversized_note_without_aborting():
             content_enml="<en-note><div>ok</div></en-note>",
         ),
     ]
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(main_module.time, "sleep", lambda seconds: sleep_calls.append(seconds))
 
     _upload_sections(
         uploader=uploader,
@@ -147,6 +150,7 @@ def test_upload_sections_skips_oversized_note_without_aborting():
     )
 
     assert uploader.created_pages == 1
+    assert sleep_calls == [2.0]
 
 
 def test_run_gui_mode_no_stdin_shows_error_instead_of_terminal_fallback(monkeypatch):

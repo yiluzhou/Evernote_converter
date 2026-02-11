@@ -81,6 +81,19 @@ class OneNoteRequestSizeLimitError(RuntimeError):
     """The note cannot be uploaded due to OneNote request-size limits."""
 
 
+def _build_session_expired_error(error_text: str) -> AzureSetupGuidanceError:
+    prompt = _build_chatgpt_prompt(error_text or "Session expired")
+    return AzureSetupGuidanceError(
+        "Sign-in expired or authorization lost",
+        (
+            "Your Microsoft Graph session is no longer authorized (token expired/revoked).\n"
+            "Sign in again and resume upload.\n"
+            "If this keeps happening, verify that device-code sign-in completed under the same Microsoft account."
+        ),
+        prompt,
+    )
+
+
 def _read_int_env(name: str, default: int) -> int:
     raw = os.environ.get(name, "").strip()
     if not raw:
@@ -294,6 +307,15 @@ def _classify_azure_setup_error(error_text: str) -> AzureSetupGuidanceError:
     prompt = _build_chatgpt_prompt(text or "Unknown Azure authentication/permission error")
 
     if (
+        "invalidauthenticationtoken" in lower
+        or "token expired" in lower
+        or "access token has expired" in lower
+        or "lifetime validation failed" in lower
+        or "expiredsecuritytoken" in lower
+    ):
+        return _build_session_expired_error(text)
+
+    if (
         "aadsts700016" in lower
         or "application with identifier" in lower
         or "was not found in the directory" in lower
@@ -447,6 +469,7 @@ def _extract_evernote_guid_from_html(html: str) -> str:
 def get_graph_token(
     client_id: str,
     device_flow_callback: Callable[[dict[str, Any]], None] | None = None,
+    silent_only: bool = False,
 ) -> str:
     """
     Authenticate via device code flow and return an access token.
@@ -473,6 +496,11 @@ def get_graph_token(
         if result and "access_token" in result:
             _save_cache(cache)
             return result["access_token"]
+
+    if silent_only:
+        raise _build_session_expired_error(
+            "Silent token refresh failed; cached session is unavailable."
+        )
 
     # Fall back to device code flow
     flow = app.initiate_device_flow(scopes=SCOPES)
@@ -509,9 +537,15 @@ def _save_cache(cache: msal.SerializableTokenCache) -> None:
 class OneNoteUploader:
     """Client for creating OneNote notebooks, sections, and pages via Graph API."""
 
-    def __init__(self, access_token: str):
+    def __init__(
+        self,
+        access_token: str,
+        token_refresh_callback: Callable[[], str] | None = None,
+    ):
         self.session = requests.Session()
         self.session.headers["Authorization"] = f"Bearer {access_token}"
+        self._token_refresh_callback = token_refresh_callback
+        self._token_refresh_lock = threading.Lock()
         self._page_guid_cache: dict[str, str] = {}
         self._page_url_cache: dict[str, str] = {}
         self._write_limit_per_minute = _read_int_env(
@@ -727,10 +761,20 @@ class OneNoteUploader:
 
     def delete_page(self, page_id: str) -> None:
         """Delete a page by ID."""
-        self._request_no_content_with_retry(
-            "DELETE",
-            f"{GRAPH_BASE}/me/onenote/pages/{page_id}",
-        )
+        try:
+            self._request_no_content_with_retry(
+                "DELETE",
+                f"{GRAPH_BASE}/me/onenote/pages/{page_id}",
+            )
+        except requests.HTTPError as e:
+            resp = getattr(e, "response", None)
+            if resp is not None and resp.status_code == 404:
+                # Treat as idempotent success: page was already removed.
+                logger.info("Delete page skipped (already missing): id=%s", page_id)
+                self._page_guid_cache.pop(page_id, None)
+                self._page_url_cache.pop(page_id, None)
+                return
+            raise
         self._page_guid_cache.pop(page_id, None)
         self._page_url_cache.pop(page_id, None)
         logger.info("Deleted page: id=%s", page_id)
@@ -861,6 +905,7 @@ class OneNoteUploader:
         self, method: str, url: str, max_retries: int = 5, **kwargs
     ) -> dict:
         """Execute an HTTP request with exponential backoff on 429."""
+        refreshed_after_401 = False
         for attempt in range(max_retries):
             self._apply_client_side_write_rate_limit()
             resp = self.session.request(method, url, **kwargs)
@@ -870,6 +915,12 @@ class OneNoteUploader:
                 logger.warning("Rate limited, waiting %ds (attempt %d)", wait, attempt + 1)
                 time.sleep(wait)
                 continue
+
+            if resp.status_code == 401 and not refreshed_after_401:
+                if self._try_refresh_access_token():
+                    refreshed_after_401 = True
+                    logger.info("Refreshed access token after HTTP 401; retrying request.")
+                    continue
 
             if 200 <= resp.status_code < 300:
                 if not resp.text:
@@ -892,6 +943,7 @@ class OneNoteUploader:
         **kwargs,
     ) -> None:
         """Execute an HTTP request expecting no JSON body, with 429 retry."""
+        refreshed_after_401 = False
         for attempt in range(max_retries):
             self._apply_client_side_write_rate_limit()
             resp = self.session.request(method, url, **kwargs)
@@ -901,6 +953,12 @@ class OneNoteUploader:
                 logger.warning("Rate limited, waiting %ds (attempt %d)", wait, attempt + 1)
                 time.sleep(wait)
                 continue
+
+            if resp.status_code == 401 and not refreshed_after_401:
+                if self._try_refresh_access_token():
+                    refreshed_after_401 = True
+                    logger.info("Refreshed access token after HTTP 401; retrying request.")
+                    continue
 
             if 200 <= resp.status_code < 300:
                 return
@@ -954,6 +1012,25 @@ class OneNoteUploader:
             )
             time.sleep(wait_seconds)
 
+    def _try_refresh_access_token(self) -> bool:
+        """Attempt one silent token refresh via callback; return True on success."""
+        if self._token_refresh_callback is None:
+            return False
+
+        with self._token_refresh_lock:
+            try:
+                new_token = self._token_refresh_callback()
+            except AzureSetupGuidanceError:
+                raise
+            except Exception as e:
+                raise _build_session_expired_error(str(e)) from e
+
+            if not new_token:
+                raise _build_session_expired_error("Token refresh callback returned empty token.")
+
+            self.session.headers["Authorization"] = f"Bearer {new_token}"
+            return True
+
     def _raise_for_status_with_guidance(self, resp: requests.Response, operation: str) -> None:
         if resp.status_code < 400:
             return
@@ -965,6 +1042,17 @@ class OneNoteUploader:
             raise OneNoteRequestSizeLimitError(
                 f"{operation} failed due to request-size limits: {error_text}"
             )
+
+        if resp.status_code == 401:
+            if (
+                "invalidauthenticationtoken" in lower
+                or "token expired" in lower
+                or "access token has expired" in lower
+                or "lifetime validation failed" in lower
+                or "expiredsecuritytoken" in lower
+                or "unauthorized" in lower
+            ):
+                raise _build_session_expired_error(f"{operation} failed: {error_text}")
 
         if resp.status_code in {400, 401, 403}:
             if (
