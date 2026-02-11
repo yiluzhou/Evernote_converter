@@ -43,6 +43,8 @@ ONENOTE_MULTIPART_PART_OVERHEAD_ESTIMATE_BYTES = 1024
 ONENOTE_MULTIPART_WARNING_RATIO = 0.9
 DEFAULT_WRITE_LIMIT_PER_MINUTE = 100
 DEFAULT_WRITE_LIMIT_PER_HOUR = 350
+TRANSIENT_RETRY_STATUS_CODES = {502, 503, 504}
+MAX_RETRY_WAIT_SECONDS = 60
 _REQUEST_SIZE_ERROR_KEYWORDS = (
     "request entity too large",
     "payload too large",
@@ -104,6 +106,24 @@ def _read_int_env(name: str, default: int) -> int:
         logger.warning("Invalid %s=%r; using default %d", name, raw, default)
         return default
     return max(value, 0)
+
+
+def _retry_wait_seconds(resp: requests.Response, attempt: int) -> int:
+    """
+    Compute retry delay for rate-limit/transient errors.
+
+    Prefers Retry-After header when available; otherwise exponential backoff.
+    """
+    raw = (resp.headers.get("Retry-After", "") or "").strip()
+    if raw:
+        try:
+            wait = int(raw)
+            return max(1, min(wait, MAX_RETRY_WAIT_SECONDS))
+        except ValueError:
+            pass
+
+    wait = 2 ** attempt
+    return max(1, min(wait, MAX_RETRY_WAIT_SECONDS))
 
 
 def _format_bytes(size: int) -> str:
@@ -904,15 +924,26 @@ class OneNoteUploader:
     def _request_with_retry(
         self, method: str, url: str, max_retries: int = 5, **kwargs
     ) -> dict:
-        """Execute an HTTP request with exponential backoff on 429."""
+        """Execute an HTTP request with retry on rate-limit/transient failures."""
         refreshed_after_401 = False
         for attempt in range(max_retries):
             self._apply_client_side_write_rate_limit()
             resp = self.session.request(method, url, **kwargs)
 
             if resp.status_code == 429:
-                wait = int(resp.headers.get("Retry-After", 2**attempt))
+                wait = _retry_wait_seconds(resp, attempt)
                 logger.warning("Rate limited, waiting %ds (attempt %d)", wait, attempt + 1)
+                time.sleep(wait)
+                continue
+
+            if resp.status_code in TRANSIENT_RETRY_STATUS_CODES:
+                wait = _retry_wait_seconds(resp, attempt)
+                logger.warning(
+                    "Transient server error %d, waiting %ds (attempt %d)",
+                    resp.status_code,
+                    wait,
+                    attempt + 1,
+                )
                 time.sleep(wait)
                 continue
 
@@ -942,15 +973,26 @@ class OneNoteUploader:
         max_retries: int = 5,
         **kwargs,
     ) -> None:
-        """Execute an HTTP request expecting no JSON body, with 429 retry."""
+        """Execute an HTTP request expecting no JSON body, with retry."""
         refreshed_after_401 = False
         for attempt in range(max_retries):
             self._apply_client_side_write_rate_limit()
             resp = self.session.request(method, url, **kwargs)
 
             if resp.status_code == 429:
-                wait = int(resp.headers.get("Retry-After", 2**attempt))
+                wait = _retry_wait_seconds(resp, attempt)
                 logger.warning("Rate limited, waiting %ds (attempt %d)", wait, attempt + 1)
+                time.sleep(wait)
+                continue
+
+            if resp.status_code in TRANSIENT_RETRY_STATUS_CODES:
+                wait = _retry_wait_seconds(resp, attempt)
+                logger.warning(
+                    "Transient server error %d, waiting %ds (attempt %d)",
+                    resp.status_code,
+                    wait,
+                    attempt + 1,
+                )
                 time.sleep(wait)
                 continue
 

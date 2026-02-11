@@ -535,6 +535,17 @@ def run_gui_wizard(
                     )
                     if upload_summary.get("aborted"):
                         return
+
+                    upload_summary = _retry_failed_notes_flow(
+                        root=root,
+                        uploader=uploader,
+                        notebook_id=notebook_id,
+                        notebook_url=notebook_url,
+                        summary=upload_summary,
+                    )
+                    if bool(upload_summary.get("aborted", False)):
+                        return
+
                     if _prompt_upload_another_file(
                         root,
                         notebook_name=notebook_name,
@@ -568,7 +579,7 @@ def _prompt_upload_another_file(
     root: tk.Tk,
     notebook_name: str,
     notebook_url: str,
-    upload_summary: dict[str, int | bool],
+    upload_summary: dict[str, object],
     total_notes: int,
 ) -> bool:
     uploaded_notes = int(upload_summary.get("uploaded_notes", 0))
@@ -596,6 +607,139 @@ def _prompt_upload_another_file(
         "\n".join(lines),
         parent=root,
     )
+
+
+def _extract_failed_note_entries(upload_summary: dict[str, object]) -> list[dict[str, object]]:
+    raw = upload_summary.get("failed_notes", [])
+    if not isinstance(raw, list):
+        return []
+    entries: list[dict[str, object]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        if "note" not in item:
+            continue
+        entries.append(item)
+    return entries
+
+
+def _build_sections_from_failed_entries(
+    failed_entries: list[dict[str, object]],
+) -> dict[str, list[EvernoteNote]]:
+    sections: dict[str, list[EvernoteNote]] = {}
+    for entry in failed_entries:
+        note = entry.get("note")
+        if not isinstance(note, EvernoteNote):
+            continue
+        section_name = str(entry.get("section_name", "")).strip() or "Recovered_Failed_Notes"
+        sections.setdefault(section_name, []).append(note)
+    return sections
+
+
+def _prompt_retry_failed_notes(
+    root: tk.Tk,
+    failed_entries: list[dict[str, object]],
+    attempt_number: int,
+) -> bool:
+    total_failed = len(failed_entries)
+    preview_titles: list[str] = []
+    for entry in failed_entries[:6]:
+        note = entry.get("note")
+        if isinstance(note, EvernoteNote):
+            title = (note.title or "").strip() or "Untitled"
+            preview_titles.append(f"- {title}")
+
+    lines = [
+        f"{total_failed} note(s) failed during upload.",
+        f"Retry attempt #{attempt_number}",
+    ]
+    if preview_titles:
+        lines.extend(["", "Examples:", *preview_titles])
+    if total_failed > len(preview_titles):
+        lines.append(f"... and {total_failed - len(preview_titles)} more")
+    lines.extend(["", "Retry failed notes now?"])
+
+    return messagebox.askyesno(
+        "Retry Failed Notes",
+        "\n".join(lines),
+        parent=root,
+    )
+
+
+def _merge_retry_summary(
+    base_summary: dict[str, object],
+    retry_summary: dict[str, object],
+) -> dict[str, object]:
+    merged = dict(base_summary)
+    merged["uploaded_notes"] = int(base_summary.get("uploaded_notes", 0)) + int(
+        retry_summary.get("uploaded_notes", 0)
+    )
+    merged["skipped_duplicates"] = int(base_summary.get("skipped_duplicates", 0)) + int(
+        retry_summary.get("skipped_duplicates", 0)
+    )
+    merged["skipped_oversized"] = int(base_summary.get("skipped_oversized", 0)) + int(
+        retry_summary.get("skipped_oversized", 0)
+    )
+    merged["replaced_pages"] = int(base_summary.get("replaced_pages", 0)) + int(
+        retry_summary.get("replaced_pages", 0)
+    )
+
+    failed_entries = _extract_failed_note_entries(retry_summary)
+    merged["failed_notes"] = failed_entries
+    merged["errors_count"] = len(failed_entries)
+    merged["aborted"] = bool(retry_summary.get("aborted", False))
+    merged["stopped_by_user"] = bool(retry_summary.get("stopped_by_user", False))
+    return merged
+
+
+def _retry_failed_notes_flow(
+    root: tk.Tk,
+    uploader: OneNoteUploader,
+    notebook_id: str,
+    notebook_url: str,
+    summary: dict[str, object],
+) -> dict[str, object]:
+    merged_summary = dict(summary)
+    attempt = 1
+
+    while True:
+        failed_entries = _extract_failed_note_entries(merged_summary)
+        if not failed_entries:
+            merged_summary["errors_count"] = 0
+            break
+
+        should_retry = _prompt_retry_failed_notes(root, failed_entries, attempt)
+        if not should_retry:
+            merged_summary["errors_count"] = len(failed_entries)
+            break
+
+        retry_sections = _build_sections_from_failed_entries(failed_entries)
+        retry_total = sum(len(notes) for notes in retry_sections.values())
+        if retry_total <= 0:
+            merged_summary["errors_count"] = 0
+            merged_summary["failed_notes"] = []
+            break
+
+        retry_estimate = uploader.estimate_upload_duration_seconds(
+            expected_page_writes=retry_total,
+            expected_section_creates=0,
+        )
+        retry_summary = _upload_with_progress_window(
+            root,
+            uploader,
+            notebook_id,
+            retry_sections,
+            retry_total,
+            notebook_url=notebook_url,
+            estimated_seconds=retry_estimate,
+        )
+        if bool(retry_summary.get("aborted", False)):
+            return retry_summary
+
+        merged_summary = _merge_retry_summary(merged_summary, retry_summary)
+        attempt += 1
+
+    return merged_summary
 
 
 def _maybe_alert_update_available(root: tk.Tk) -> None:
@@ -1247,7 +1391,7 @@ def _upload_with_progress_window(
     total_notes: int,
     notebook_url: str = "",
     estimated_seconds: float | None = None,
-) -> dict[str, int | bool]:
+) -> dict[str, object]:
     progress = tk.Toplevel(root)
     progress.title("Uploading")
     _configure_dialog(progress)
@@ -1438,7 +1582,7 @@ def _upload_with_progress_window(
     exit_button.configure(command=_exit_upload)
 
     def _worker() -> None:
-        errors: list[tuple[str, str]] = []
+        failed_entries: list[dict[str, object]] = []
         uploaded_notes = 0
         skipped_duplicates = 0
         skipped_oversized = 0
@@ -1453,18 +1597,19 @@ def _upload_with_progress_window(
                 "uploaded_notes": uploaded_notes,
                 "skipped_duplicates": skipped_duplicates,
                 "skipped_oversized": skipped_oversized,
-                "errors_count": len(errors),
+                "errors_count": len(failed_entries),
             }))
 
-        def _make_summary(extra_errors: int = 0, aborted: bool = False) -> dict:
+        def _make_summary(extra_errors: int = 0, aborted: bool = False) -> dict[str, object]:
             return {
                 "uploaded_notes": uploaded_notes,
                 "skipped_duplicates": skipped_duplicates,
                 "skipped_oversized": skipped_oversized,
                 "replaced_pages": replaced_pages,
-                "errors_count": len(errors) + extra_errors,
+                "errors_count": len(failed_entries) + extra_errors,
                 "aborted": aborted,
                 "stopped_by_user": bool(aborted and stop_event.is_set()),
+                "failed_notes": list(failed_entries),
             }
 
         def _wait_for_resume_or_stop() -> bool:
@@ -1583,7 +1728,13 @@ def _upload_with_progress_window(
                                 return
                             except Exception as e:
                                 delete_failed = True
-                                errors.append((note.title, f"Failed deleting page '{page_id}': {e}"))
+                                failed_entries.append(
+                                    {
+                                        "section_name": section_name,
+                                        "note": note,
+                                        "error": f"Failed deleting page '{page_id}': {e}",
+                                    }
+                                )
                                 ui_queue.put(("log", f"ERROR deleting duplicate page '{page_id}': {e}"))
 
                         if delete_failed:
@@ -1628,7 +1779,13 @@ def _upload_with_progress_window(
                         skipped_oversized += 1
                         ui_queue.put(("log", f"SKIP oversized note: {note.title} ({e})"))
                     else:
-                        errors.append((note.title, str(e)))
+                        failed_entries.append(
+                            {
+                                "section_name": section_name,
+                                "note": note,
+                                "error": str(e),
+                            }
+                        )
                         ui_queue.put(("log", f"ERROR: '{note.title}': {e}"))
 
                 current_done += 1
@@ -1639,7 +1796,7 @@ def _upload_with_progress_window(
 
     threading.Thread(target=_worker, daemon=True).start()
 
-    final_result: dict[str, int | bool] = {
+    final_result: dict[str, object] = {
         "uploaded_notes": 0,
         "skipped_duplicates": 0,
         "skipped_oversized": 0,
@@ -1647,6 +1804,7 @@ def _upload_with_progress_window(
         "errors_count": 0,
         "aborted": True,
         "stopped_by_user": False,
+        "failed_notes": [],
     }
     progress.protocol("WM_DELETE_WINDOW", _exit_upload)
 

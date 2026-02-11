@@ -3,6 +3,7 @@
 import os
 import sys
 import types
+from datetime import datetime
 from pathlib import Path
 
 # Add src to path
@@ -202,3 +203,81 @@ def test_remaining_estimate_keeps_baseline_weight_early():
         progress_samples=[(0.0, 0), (60.0, 2)],
     )
     assert remaining > 30 * 60
+
+
+def test_failed_notes_offer_retry_after_upload(monkeypatch):
+    monkeypatch.setattr(gui_wizard.tk, "Tk", lambda: _FakeRoot())
+    monkeypatch.setattr(gui_wizard, "_setup_styles", lambda root: None)
+    monkeypatch.setattr(gui_wizard, "_maybe_alert_update_available", lambda root: None)
+    monkeypatch.setattr(gui_wizard, "_maybe_warn_multipart_size_risks", lambda root, all_sections: None)
+
+    welcome_results = iter([Path("retry.enex"), None])
+    monkeypatch.setattr(gui_wizard, "_show_welcome_dialog", lambda root, d: next(welcome_results))
+
+    note = gui_wizard.EvernoteNote(
+        title="Retry me",
+        created=datetime(2025, 1, 1, 0, 0, 0),
+        updated=datetime(2025, 1, 1, 0, 0, 0),
+        content_enml="<en-note><div>x</div></en-note>",
+    )
+    monkeypatch.setattr(gui_wizard, "_parse_selected_enex_files", lambda files: ({"sec": [note]}, 1))
+    monkeypatch.setattr(
+        gui_wizard, "_show_note_preview_dialog", lambda root, all_sections, total_notes: gui_wizard._ACTION_NEXT
+    )
+    monkeypatch.setattr(gui_wizard, "_show_azure_setup_dialog", lambda root, cid, msg: "client-id")
+
+    class _Uploader:
+        @staticmethod
+        def estimate_upload_duration_seconds(expected_page_writes, expected_section_creates):
+            return 0
+
+    monkeypatch.setattr(gui_wizard, "_authenticate_with_busy_dialog", lambda root, cid: _Uploader())
+    monkeypatch.setattr(
+        gui_wizard,
+        "_choose_notebook",
+        lambda root, uploader, default_name: ("nb-id", "Notebook", "https://example.test/notebook", True),
+    )
+
+    uploads = {"count": 0}
+
+    def _fake_upload(*args, **kwargs):
+        uploads["count"] += 1
+        if uploads["count"] == 1:
+            return {
+                "uploaded_notes": 0,
+                "skipped_duplicates": 0,
+                "skipped_oversized": 0,
+                "replaced_pages": 0,
+                "errors_count": 1,
+                "aborted": False,
+                "stopped_by_user": False,
+                "failed_notes": [
+                    {"section_name": "sec", "note": note, "error": "transient error"},
+                ],
+            }
+        return {
+            "uploaded_notes": 1,
+            "skipped_duplicates": 0,
+            "skipped_oversized": 0,
+            "replaced_pages": 0,
+            "errors_count": 0,
+            "aborted": False,
+            "stopped_by_user": False,
+            "failed_notes": [],
+        }
+
+    monkeypatch.setattr(gui_wizard, "_upload_with_progress_window", _fake_upload)
+    monkeypatch.setattr(gui_wizard, "_prompt_retry_failed_notes", lambda root, failed, attempt: True)
+    monkeypatch.setattr(
+        gui_wizard,
+        "_prompt_upload_another_file",
+        lambda root, notebook_name, notebook_url, upload_summary, total_notes: False,
+    )
+
+    gui_wizard.run_gui_wizard(
+        default_enex_dir=Path("."),
+        default_notebook_name="Notebook",
+        default_client_id="",
+    )
+
+    assert uploads["count"] == 2

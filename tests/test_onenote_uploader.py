@@ -311,6 +311,73 @@ def test_request_with_retry_refreshes_token_on_401(monkeypatch):
     assert uploader.session.headers["Authorization"] == "Bearer new-token"
 
 
+def test_request_with_retry_retries_on_504_then_succeeds(monkeypatch):
+    class _Session504ThenOK:
+        def __init__(self):
+            self.calls = 0
+            self.headers = {"Authorization": "Bearer token"}
+
+        def request(self, method: str, url: str, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _FakeResponse(
+                    payload={
+                        "error": {
+                            "code": "GatewayTimeout",
+                            "message": "The upstream service timed out.",
+                        }
+                    },
+                    status_code=504,
+                    text='{"error":{"code":"GatewayTimeout"}}',
+                )
+            return _FakeResponse(payload={"id": "page-504"}, status_code=201, text='{"id":"page-504"}')
+
+    uploader = OneNoteUploader("token")
+    uploader.session = _Session504ThenOK()
+    monkeypatch.setattr(uploader, "_apply_client_side_write_rate_limit", lambda: None)
+    sleeps: list[float] = []
+    monkeypatch.setattr(sys.modules["onenote_uploader"].time, "sleep", lambda s: sleeps.append(s))
+
+    payload = uploader._request_with_retry("POST", "https://example.test/pages")
+
+    assert payload["id"] == "page-504"
+    assert uploader.session.calls == 2
+    assert sleeps
+
+
+def test_request_no_content_with_retry_retries_on_504_then_succeeds(monkeypatch):
+    class _Session504Then204:
+        def __init__(self):
+            self.calls = 0
+            self.headers = {"Authorization": "Bearer token"}
+
+        def request(self, method: str, url: str, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _FakeResponse(
+                    payload={
+                        "error": {
+                            "code": "GatewayTimeout",
+                            "message": "The upstream service timed out.",
+                        }
+                    },
+                    status_code=504,
+                    text='{"error":{"code":"GatewayTimeout"}}',
+                )
+            return _FakeResponse(payload={}, status_code=204, text="")
+
+    uploader = OneNoteUploader("token")
+    uploader.session = _Session504Then204()
+    monkeypatch.setattr(uploader, "_apply_client_side_write_rate_limit", lambda: None)
+    sleeps: list[float] = []
+    monkeypatch.setattr(sys.modules["onenote_uploader"].time, "sleep", lambda s: sleeps.append(s))
+
+    uploader._request_no_content_with_retry("DELETE", "https://example.test/pages/page-1")
+
+    assert uploader.session.calls == 2
+    assert sleeps
+
+
 def test_get_graph_token_device_flow_callback_receives_flow(monkeypatch, tmp_path):
     class _FakeCache:
         def deserialize(self, _text):
